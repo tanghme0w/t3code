@@ -108,3 +108,27 @@ The packaged app runs its own server against the _default_ `~/.t3`
 userdata (not the dev state in `~/.t3/dev`), so the gateway-flagged
 provider instance must be configured there too, and the agent-hub gateway
 must be running before threads use gateway models.
+
+## Desktop identity on this branch
+
+This branch's desktop build is rebranded **Agent Hub Code** so it installs
+and runs alongside the official T3 Code (Alpha) without colliding on
+Launch Services, the Electron single-instance lock, or
+`~/Library/Application Support` (all keyed off the product name / appId):
+
+- `apps/desktop/package.json` `productName: "Agent Hub Code"`
+- `scripts/build-desktop-artifact.ts` `DESKTOP_APP_ID: com.agenthub.code`,
+  artifact `Agent-Hub-Code-<version>-<arch>.dmg`
+- `apps/desktop/src/app/DesktopEnvironment.ts` `APP_BASE_NAME` (in-app name)
+- `apps/desktop/resources/icon.icns` / `icon.png` — minimalist hub mark
+  (ink squircle, white hub-and-spokes, one accent-blue node)
+
+All hooks carry the `[agent-hub] rebrand` anchor. Install: mount the dmg
+and copy "Agent Hub Code.app" into /Applications (no quarantine attr on a
+local build).
+
+One caveat both apps share: the **server** state dir is `~/.t3` regardless
+of the Electron identity, so threads/projects/settings are common. Don't
+run both apps at the same time, and note the official build shows a
+gateway-flagged Claude instance as a plain erroring one (it lacks the
+integration code).
