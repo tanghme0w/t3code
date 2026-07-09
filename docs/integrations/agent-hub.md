@@ -65,3 +65,46 @@ grep -rn '\[agent-hub\]' apps/server/src
    message, switch to a different provider's model mid-thread, and confirm
    the route flip in agent-hub's sqlite:
    `sqlite3 ~/.agent-hub/hub.sqlite "SELECT id, current_route_provider, current_route_model FROM sessions WHERE id LIKE 't3-%';"`
+
+## Running & packaging (this network / machine)
+
+Dev stack (server :13773 + web :5733; pair via the URL the server logs):
+
+```sh
+# once: deps — the default npm registry here (mirrors.tencent.com) is
+# flaky for some tarballs; pin the official one
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 pnpm install --registry=https://registry.npmjs.org/
+
+# every session: the gateway first, from the agent-hub repo root
+bun run packages/gateway/src/index.ts
+
+bun run dev
+```
+
+Desktop app (arm64 dmg). electron-builder downloads a 116 MB electron zip
+plus a dmg-builder bundle at build time; from this network both direct
+GitHub and npmmirror's CDN abort on the multi-part download, so serve them
+from a local one-shot mirror (the layout electron-builder expects is
+`{mirror}/v<ver>/<zip>` and `{mirror}/dmg-builder@<ver>/<bundle>`):
+
+```sh
+# once: electron runtime for apps/desktop (skipped at install time);
+# install.js's single-stream download DOES survive npmmirror
+cd apps/desktop/node_modules/electron && \
+  ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/" node install.js
+
+# once: stage a local mirror from the cache install.js just filled
+MIR=/tmp/electron-mirror
+mkdir -p "$MIR/v41.5.0" "$MIR/dmg-builder@1.2.0"
+cp ~/Library/Caches/electron/*/electron-v41.5.0-darwin-arm64.zip "$MIR/v41.5.0/"
+curl -sL -o "$MIR/dmg-builder@1.2.0/dmgbuild-bundle-arm64-75c8a6c.tar.gz" \
+  "https://npmmirror.com/mirrors/electron-builder-binaries/dmg-builder@1.2.0/dmgbuild-bundle-arm64-75c8a6c.tar.gz"
+(cd "$MIR" && python3 -m http.server 8099 --bind 127.0.0.1 &)
+
+ELECTRON_MIRROR="http://127.0.0.1:8099/" bun run dist:desktop:dmg:arm64
+```
+
+The packaged app runs its own server against the _default_ `~/.t3`
+userdata (not the dev state in `~/.t3/dev`), so the gateway-flagged
+provider instance must be configured there too, and the agent-hub gateway
+must be running before threads use gateway models.
