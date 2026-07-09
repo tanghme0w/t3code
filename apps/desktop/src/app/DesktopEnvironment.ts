@@ -78,6 +78,15 @@ export class DesktopEnvironment extends Context.Service<
 
 const APP_BASE_NAME = "Agent Hub Code"; // [agent-hub] rebrand
 
+// [agent-hub] rebrand — backend decoupling. This fork must share no server or
+// desktop state with a canonical t3code install (which owns ~/.t3 and the
+// "t3code" Electron userData dir). The packaged app gets its own state root and
+// userData dir; dev is deliberately left on ~/.t3/dev — dev-runner sets an
+// explicit T3CODE_HOME so this fallback never fires there, and no canonical dev
+// build runs from this repo.
+const FORK_STATE_DIR_NAME = ".agent-hub-code";
+const FORK_USER_DATA_DIR_NAME = "agent-hub-code";
+
 function resolveDesktopAppStageLabel(input: {
   readonly isDevelopment: boolean;
   readonly appVersion: string;
@@ -147,7 +156,12 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : input.platform === "darwin"
         ? path.join(homeDirectory, "Library", "Application Support")
         : Option.getOrElse(config.xdgConfigHome, () => path.join(homeDirectory, ".config"));
-  const baseDir = Option.getOrElse(config.t3Home, () => path.join(homeDirectory, ".t3"));
+  // [agent-hub] rebrand — was `.t3`. Only the packaged app reaches this
+  // fallback (dev-runner always exports T3CODE_HOME), so a canonical t3code
+  // install keeps ~/.t3 entirely to itself.
+  const baseDir = Option.getOrElse(config.t3Home, () =>
+    path.join(homeDirectory, FORK_STATE_DIR_NAME),
+  );
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
   const branding = resolveDesktopAppBranding({
@@ -156,8 +170,11 @@ const make = Effect.fn("desktop.environment.make")(function* (
   });
   const displayName = branding.displayName;
   const stateDir = path.join(baseDir, isDevelopment ? "dev" : "userdata");
-  const userDataDirName = isDevelopment ? "t3code-dev" : "t3code";
-  const legacyUserDataDirName = isDevelopment ? "T3 Code (Dev)" : "T3 Code (Alpha)";
+  // [agent-hub] rebrand — prod Electron/Chromium userData dir (was "t3code",
+  // legacy "T3 Code (Alpha)"). Prod legacy points at the fork's own dir so it
+  // never falls back onto a canonical install's userData. Dev is untouched.
+  const userDataDirName = isDevelopment ? "t3code-dev" : FORK_USER_DATA_DIR_NAME;
+  const legacyUserDataDirName = isDevelopment ? "T3 Code (Dev)" : FORK_USER_DATA_DIR_NAME;
   const resourcesPath = input.resourcesPath;
 
   return DesktopEnvironment.of({

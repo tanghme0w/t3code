@@ -550,6 +550,7 @@ interface ResolvedBuildOptions {
 
 interface StagePackageJson {
   readonly name: string;
+  readonly productName: string;
   readonly version: string;
   readonly buildVersion: string;
   readonly t3codeCommitHash: string;
@@ -1390,10 +1391,13 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       target: target === "dmg" ? [target, "zip"] : [target],
       icon: "icon.icns",
       category: "public.app-category.developer-tools",
+      // [agent-hub] rebrand — own OS-level URL scheme so this fork never claims
+      // t3code:// from a canonical install (nothing handles open-url today; the
+      // in-process t3code://app UI scheme is per-app and unaffected).
       protocols: [
         {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
+          name: "Agent Hub Code",
+          schemes: ["agent-hub-code"],
         },
       ],
       ...(macPasskeySigning
@@ -1711,13 +1715,17 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   };
   const stagePnpmConfig = createStagePnpmConfig(workspacePatchedDependencies, stageDependencies);
   const stagePackageJson: StagePackageJson = {
-    name: "t3code",
+    // [agent-hub] rebrand — Electron app.name = productName ?? name, and Chromium
+    // derives the keychain item "<app.name> Safe Storage" from it. Staying on
+    // "t3code" made this fork share the canonical install's keychain entry.
+    name: "agent-hub-code",
+    productName: "Agent Hub Code",
     version: appVersion,
     buildVersion: appVersion,
     t3codeCommitHash: commitHash,
     private: true,
     packageManager: rootPackageJson.packageManager,
-    description: "T3 Code desktop build",
+    description: "Agent Hub Code desktop build", // [agent-hub] rebrand
     author: "T3 Tools",
     main: "apps/desktop/dist-electron/main.cjs",
     build: yield* createBuildConfig(
