@@ -33,6 +33,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import { HttpBody, HttpClient, HttpClientRequest } from "effect/unstable/http";
 
+import { getClaudeModelCapabilities } from "./Layers/ClaudeProvider.ts";
+import type { ServerProviderDraft } from "./providerSnapshot.ts";
+
 export const AGENT_HUB_GATEWAY_URL_ENV = "AGENT_HUB_GATEWAY_URL";
 export const AGENT_HUB_GATEWAY_TOKEN_ENV = "AGENT_HUB_GATEWAY_TOKEN";
 export const AGENT_HUB_DEFAULT_ROUTE_ENV = "AGENT_HUB_DEFAULT_ROUTE";
@@ -319,4 +322,167 @@ export function agentHubGatewayModels(
     }
   }
   return models;
+}
+
+// ---------------------------------------------------------------------------
+// Seams — the only API upstream files call. ClaudeDriver/ClaudeAdapter touch
+// this module exclusively at hook lines anchored with `[agent-hub]` comments
+// (grep for that tag to audit them after a rebase); all integration logic
+// lives here so upstream merges stay conflict-free.
+// ---------------------------------------------------------------------------
+
+export interface AgentHubInstanceIntegration {
+  readonly config: AgentHubGatewayConfig;
+  readonly client: HttpClient.HttpClient;
+}
+
+export interface AgentHubInstanceInit {
+  readonly env: NodeJS.ProcessEnv;
+  readonly integration: AgentHubInstanceIntegration | undefined;
+}
+
+/**
+ * Driver-side entry point (ClaudeDriver.create). Detects the opt-in marker
+ * in the instance environment; when present, derives the static instance env
+ * (capability probes and text generation route through the per-instance
+ * gateway session) and ensures the instance's default route exists —
+ * best-effort, a dead gateway degrades to a plain Claude instance. Identity
+ * when the marker is absent.
+ */
+export const initAgentHubInstance = Effect.fn("initAgentHubInstance")(function* (input: {
+  readonly instanceId: string;
+  readonly environment: NodeJS.ProcessEnv;
+  readonly client: HttpClient.HttpClient;
+}) {
+  const config = yield* readAgentHubGatewayConfig(input.environment);
+  if (!config) {
+    return { env: input.environment, integration: undefined } satisfies AgentHubInstanceInit;
+  }
+  yield* fetchAgentHubCatalog(input.client, config).pipe(
+    Effect.flatMap((catalog) => {
+      const route = resolveAgentHubDefaultRoute(config, catalog);
+      return route
+        ? ensureAgentHubRoute(
+            input.client,
+            config,
+            agentHubInstanceSessionKey(input.instanceId),
+            route,
+          )
+        : Effect.logWarning("claude.agent-hub.no-default-route", {
+            instanceId: input.instanceId,
+          });
+    }),
+    Effect.catch((error) =>
+      Effect.logWarning("claude.agent-hub.bootstrap-failed", {
+        instanceId: input.instanceId,
+        error: error.message,
+      }),
+    ),
+  );
+  return {
+    env: {
+      ...input.environment,
+      ...agentHubSessionEnv(config, agentHubInstanceSessionKey(input.instanceId)),
+    },
+    integration: { config, client: input.client },
+  } satisfies AgentHubInstanceInit;
+});
+
+/**
+ * Snapshot pipe stage (ClaudeDriver checkProvider/initialSnapshot): appends
+ * the gateway provider×model catalog to the instance model list. Catalog
+ * failures degrade to the unmodified snapshot.
+ */
+export const withAgentHubGatewayModels =
+  (integration: AgentHubInstanceIntegration | undefined) =>
+  (snapshot: ServerProviderDraft): Effect.Effect<ServerProviderDraft> => {
+    if (!integration) return Effect.succeed(snapshot);
+    return fetchAgentHubCatalog(integration.client, integration.config).pipe(
+      Effect.map((catalog) => ({
+        ...snapshot,
+        models: [
+          ...agentHubGatewayModels(catalog, getClaudeModelCapabilities(undefined)),
+          ...(snapshot.models ?? []),
+        ],
+      })),
+      Effect.catch((error) =>
+        Effect.logWarning("claude.agent-hub.catalog-failed", { error: error.message }).pipe(
+          Effect.as(snapshot),
+        ),
+      ),
+    );
+  };
+
+export interface AgentHubAdapterHooks {
+  /** Per-thread env override for the spawned process; identity when not opted in. */
+  readonly env: (threadId: string, base: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  /**
+   * Sync the gateway route table from a turn's model slug BEFORE the prompt
+   * is queued. Matrix slugs (`<provider>/<model>`) switch the route; other
+   * slugs (built-in Claude models) leave the current route alone unless
+   * `fallbackToDefault` asks for a guaranteed row. The running process picks
+   * the new route up on its next API request — no respawn.
+   */
+  readonly syncRoute: (
+    threadId: string,
+    model: string | undefined,
+    cwd: string | undefined,
+    opts: { readonly fallbackToDefault: boolean },
+  ) => Effect.Effect<void, AgentHubGatewayError>;
+  /** syncRoute for session start: failures degrade to a gateway-side 502. */
+  readonly syncRouteBestEffort: (
+    threadId: string,
+    model: string | undefined,
+    cwd: string | undefined,
+  ) => Effect.Effect<void>;
+}
+
+const NO_HOOKS: AgentHubAdapterHooks = {
+  env: (_threadId, base) => base,
+  syncRoute: () => Effect.void,
+  syncRouteBestEffort: () => Effect.void,
+};
+
+/** Adapter-side entry point (makeClaudeAdapter head). Inert without opt-in. */
+export function agentHubAdapterHooks(
+  integration: AgentHubInstanceIntegration | undefined,
+): AgentHubAdapterHooks {
+  if (!integration) return NO_HOOKS;
+  const { config, client } = integration;
+  const syncRoute = Effect.fn("agentHub.syncRoute")(function* (
+    threadId: string,
+    model: string | undefined,
+    cwd: string | undefined,
+    opts: { readonly fallbackToDefault: boolean },
+  ) {
+    const catalog = yield* fetchAgentHubCatalog(client, config);
+    const route =
+      (model !== undefined ? resolveAgentHubRouteForModel(model, catalog) : undefined) ??
+      (opts.fallbackToDefault ? resolveAgentHubDefaultRoute(config, catalog) : undefined);
+    if (!route) return;
+    yield* ensureAgentHubRoute(client, config, agentHubThreadSessionKey(threadId), route, {
+      ...(cwd !== undefined ? { workspacePath: cwd } : {}),
+    });
+    yield* Effect.logInfo("claude.agent-hub.route", {
+      threadId,
+      provider: route.provider,
+      model: route.model,
+    });
+  });
+  return {
+    env: (threadId, base) => ({
+      ...base,
+      ...agentHubSessionEnv(config, agentHubThreadSessionKey(threadId)),
+    }),
+    syncRoute,
+    syncRouteBestEffort: (threadId, model, cwd) =>
+      syncRoute(threadId, model, cwd, { fallbackToDefault: true }).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("claude.agent-hub.route-sync-failed", {
+            threadId,
+            error: error.message,
+          }),
+        ),
+      ),
+  };
 }

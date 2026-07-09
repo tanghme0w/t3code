@@ -70,17 +70,7 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
-import type { HttpClient } from "effect/unstable/http";
-
-import {
-  agentHubSessionEnv,
-  agentHubThreadSessionKey,
-  ensureAgentHubRoute,
-  fetchAgentHubCatalog,
-  resolveAgentHubDefaultRoute,
-  resolveAgentHubRouteForModel,
-  type AgentHubGatewayConfig,
-} from "../agentHubGateway.ts";
+import { agentHubAdapterHooks, type AgentHubInstanceIntegration } from "../agentHubGateway.ts"; // [agent-hub]
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
@@ -231,11 +221,8 @@ export interface ClaudeAdapterLiveOptions {
   }) => ClaudeQueryRuntime;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
-  /** Present when the instance routes through agent-hub's gateway (ClaudeDriver detects the marker env). */
-  readonly agentHubGateway?: {
-    readonly config: AgentHubGatewayConfig;
-    readonly client: HttpClient.HttpClient;
-  };
+  /** [agent-hub] Present when the instance routes through agent-hub's gateway (ClaudeDriver detects the marker env). */
+  readonly agentHubGateway?: AgentHubInstanceIntegration;
 }
 
 function isUuid(value: string): boolean {
@@ -1363,43 +1350,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
   );
-  const agentHubGateway = options?.agentHubGateway;
-
-  /**
-   * Sync the agent-hub gateway route table for a thread's session key from
-   * the selected model slug. Matrix slugs (`<provider>/<model>`) switch the
-   * route; other slugs (built-in Claude models) leave the current route
-   * alone unless `fallbackToDefault` asks for a guaranteed row (session
-   * start). The running `claude` process picks the new route up on its next
-   * API request — no respawn.
-   */
-  const syncAgentHubRoute = Effect.fn("syncAgentHubRoute")(function* (
-    threadId: string,
-    model: string | undefined,
-    cwd: string | undefined,
-    opts: { readonly fallbackToDefault: boolean },
-  ) {
-    if (!agentHubGateway) return;
-    const catalog = yield* fetchAgentHubCatalog(agentHubGateway.client, agentHubGateway.config);
-    const route =
-      (model !== undefined ? resolveAgentHubRouteForModel(model, catalog) : undefined) ??
-      (opts.fallbackToDefault
-        ? resolveAgentHubDefaultRoute(agentHubGateway.config, catalog)
-        : undefined);
-    if (!route) return;
-    yield* ensureAgentHubRoute(
-      agentHubGateway.client,
-      agentHubGateway.config,
-      agentHubThreadSessionKey(threadId),
-      route,
-      { ...(cwd !== undefined ? { workspacePath: cwd } : {}) },
-    );
-    yield* Effect.logInfo("claude.agent-hub.route", {
-      threadId,
-      provider: route.provider,
-      model: route.model,
-    });
-  });
+  const agentHub = agentHubAdapterHooks(options?.agentHubGateway); // [agent-hub] inert without opt-in
   const nativeEventLogger =
     options?.nativeEventLogger ??
     (options?.nativeEventLogPath !== undefined
@@ -3492,20 +3443,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(fastMode ? { fastMode: true } : {}),
         ...(ultracode ? { ultracode: true } : {}),
       };
-      // Gateway routing must be in place before the process makes its first
-      // API call; failures degrade to a clear 502 from the gateway itself.
-      if (agentHubGateway) {
-        yield* syncAgentHubRoute(threadId, apiModelId, input.cwd, {
-          fallbackToDefault: true,
-        }).pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("claude.agent-hub.route-sync-failed", {
-              threadId,
-              error: error.message,
-            }),
-          ),
-        );
-      }
+      // [agent-hub] Route must exist before the process's first API call.
+      yield* agentHub.syncRouteBestEffort(threadId, apiModelId, input.cwd);
 
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       const queryOptions: ClaudeQueryOptions = {
@@ -3530,12 +3469,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(newSessionId ? { sessionId: newSessionId } : {}),
         includePartialMessages: true,
         canUseTool,
-        env: agentHubGateway
-          ? {
-              ...claudeEnvironment,
-              ...agentHubSessionEnv(agentHubGateway.config, agentHubThreadSessionKey(threadId)),
-            }
-          : claudeEnvironment,
+        env: agentHub.env(threadId, claudeEnvironment), // [agent-hub]
         ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
         ...(mcpSession
@@ -3742,14 +3676,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...context.session,
         model: modelSelection.model,
       };
-      // Matrix slugs re-point the gateway route before the prompt is queued,
-      // so the switch applies to this turn. Route failures fail the turn —
-      // silently continuing would run it on the previous provider.
-      yield* syncAgentHubRoute(input.threadId, apiModelId, context.session.cwd, {
-        fallbackToDefault: false,
-      }).pipe(
-        Effect.mapError((cause) => toRequestError(input.threadId, "turn/agentHubRoute", cause)),
-      );
+      // [agent-hub] Matrix slugs re-point the gateway route before the prompt
+      // is queued; failing silently would run the turn on the old provider.
+      yield* agentHub
+        .syncRoute(input.threadId, apiModelId, context.session.cwd, { fallbackToDefault: false })
+        .pipe(
+          Effect.mapError((cause) => toRequestError(input.threadId, "turn/agentHubRoute", cause)),
+        );
     }
 
     // Apply interaction mode by switching the SDK's permission mode.
