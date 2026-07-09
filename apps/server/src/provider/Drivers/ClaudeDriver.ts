@@ -26,10 +26,21 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeClaudeTextGeneration } from "../../textGeneration/ClaudeTextGeneration.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import {
+  agentHubGatewayModels,
+  agentHubInstanceSessionKey,
+  agentHubSessionEnv,
+  ensureAgentHubRoute,
+  fetchAgentHubCatalog,
+  readAgentHubGatewayConfig,
+  resolveAgentHubDefaultRoute,
+  type AgentHubGatewayConfig,
+} from "../agentHubGateway.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeClaudeAdapter } from "../Layers/ClaudeAdapter.ts";
 import {
   checkClaudeProviderStatus,
+  getClaudeModelCapabilities,
   makePendingClaudeProvider,
   probeClaudeCapabilities,
 } from "../Layers/ClaudeProvider.ts";
@@ -91,6 +102,32 @@ export type ClaudeDriverEnv =
   | ServerConfig
   | ServerSettingsService;
 
+/**
+ * Instances that opt into agent-hub gateway routing (marker variable
+ * AGENT_HUB_GATEWAY_URL in the instance environment) get the gateway's
+ * provider×model catalog appended to their model list. Catalog failures
+ * degrade to the plain Claude list instead of failing the snapshot.
+ */
+const withAgentHubGatewayModels =
+  (gateway: AgentHubGatewayConfig | undefined, client: HttpClient.HttpClient) =>
+  (snapshot: ServerProviderDraft): Effect.Effect<ServerProviderDraft> => {
+    if (!gateway) return Effect.succeed(snapshot);
+    return fetchAgentHubCatalog(client, gateway).pipe(
+      Effect.map((catalog) => {
+        const gatewayModels = agentHubGatewayModels(catalog, getClaudeModelCapabilities(undefined));
+        return {
+          ...snapshot,
+          models: [...gatewayModels, ...(snapshot.models ?? [])],
+        };
+      }),
+      Effect.catch((error) =>
+        Effect.logWarning("claude.agent-hub.catalog-failed", { error: error.message }).pipe(
+          Effect.as(snapshot),
+        ),
+      ),
+    );
+  };
+
 const withInstanceIdentity =
   (input: {
     readonly instanceId: ProviderInstance["instanceId"];
@@ -122,7 +159,38 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
-      const processEnv = mergeProviderInstanceEnvironment(environment);
+      const mergedEnv = mergeProviderInstanceEnvironment(environment);
+      const agentHubGateway = yield* readAgentHubGatewayConfig(mergedEnv);
+      // Static env for everything that is not a per-thread agent session
+      // (capability probes, text generation): route through a per-instance
+      // gateway session. ClaudeAdapter overrides this per thread.
+      const processEnv = agentHubGateway
+        ? {
+            ...mergedEnv,
+            ...agentHubSessionEnv(agentHubGateway, agentHubInstanceSessionKey(instanceId)),
+          }
+        : mergedEnv;
+      if (agentHubGateway) {
+        yield* fetchAgentHubCatalog(httpClient, agentHubGateway).pipe(
+          Effect.flatMap((catalog) => {
+            const route = resolveAgentHubDefaultRoute(agentHubGateway, catalog);
+            return route
+              ? ensureAgentHubRoute(
+                  httpClient,
+                  agentHubGateway,
+                  agentHubInstanceSessionKey(instanceId),
+                  route,
+                )
+              : Effect.logWarning("claude.agent-hub.no-default-route", { instanceId });
+          }),
+          Effect.catch((error) =>
+            Effect.logWarning("claude.agent-hub.bootstrap-failed", {
+              instanceId,
+              error: error.message,
+            }),
+          ),
+        );
+      }
       const fallbackContinuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
         instanceId,
@@ -144,6 +212,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         instanceId,
         environment: processEnv,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
+        ...(agentHubGateway
+          ? { agentHubGateway: { config: agentHubGateway, client: httpClient } }
+          : {}),
       };
       const adapter = yield* makeClaudeAdapter(effectiveConfig, adapterOptions);
       const textGeneration = yield* makeClaudeTextGeneration(effectiveConfig, processEnv);
@@ -165,6 +236,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         () => Cache.get(capabilitiesProbeCache, capabilitiesCacheKey),
         processEnv,
       ).pipe(
+        Effect.flatMap(withAgentHubGatewayModels(agentHubGateway, httpClient)),
         Effect.map(stampIdentity),
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
         Effect.provideService(Path.Path, path),
@@ -177,7 +249,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         streamSettings: snapshotSettings.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
-          makePendingClaudeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
+          makePendingClaudeProvider(settings.provider).pipe(
+            Effect.flatMap(withAgentHubGatewayModels(agentHubGateway, httpClient)),
+            Effect.map(stampIdentity),
+          ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
           enrichProviderSnapshotWithVersionAdvisory(snapshot, maintenanceCapabilities, {
