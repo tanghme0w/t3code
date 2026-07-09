@@ -343,11 +343,33 @@ export async function waitForStartedServerThread(
   threadRef: ScopedThreadRef,
   timeoutMs = 1_000,
 ): Promise<boolean> {
+  return await waitForServerThreadCondition(threadRef, threadHasStarted, timeoutMs);
+}
+
+// [thread-fork] A forked thread never "starts" a turn on its own — its
+// history is cloned, not run — so navigating to it needs to wait only for
+// the detail atom to be populated (the thread exists client-side), otherwise
+// the route guard races the subscription and bounces to "/".
+export async function waitForServerThreadExists(
+  threadRef: ScopedThreadRef,
+  timeoutMs = 2_000,
+): Promise<boolean> {
+  return await waitForServerThreadCondition(
+    threadRef,
+    (thread) => thread !== null && thread !== undefined,
+    timeoutMs,
+  );
+}
+
+async function waitForServerThreadCondition(
+  threadRef: ScopedThreadRef,
+  predicate: (thread: Thread | null | undefined) => boolean,
+  timeoutMs: number,
+): Promise<boolean> {
   const threadAtom = environmentThreadDetails.detailAtom(threadRef);
   const getThread = () => appAtomRegistry.get(threadAtom);
-  const thread = getThread();
 
-  if (threadHasStarted(thread)) {
+  if (predicate(getThread())) {
     return true;
   }
 
@@ -367,13 +389,13 @@ export async function waitForStartedServerThread(
     };
 
     const unsubscribe = appAtomRegistry.subscribe(threadAtom, (thread) => {
-      if (!threadHasStarted(thread)) {
+      if (!predicate(thread)) {
         return;
       }
       finish(true);
     });
 
-    if (threadHasStarted(getThread())) {
+    if (predicate(getThread())) {
       finish(true);
       return;
     }

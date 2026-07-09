@@ -6,6 +6,7 @@ import {
   type ArchiveThreadInput,
   type CreateThreadInput,
   type DeleteThreadInput,
+  type ForkThreadInput, // [thread-fork]
   type InterruptThreadTurnInput,
   type RespondToThreadApprovalInput,
   type RespondToThreadUserInputInput,
@@ -19,6 +20,7 @@ import {
   archiveThread,
   createThread,
   deleteThread,
+  forkThread, // [thread-fork]
   interruptThreadTurn,
   respondToThreadApproval,
   respondToThreadUserInput,
@@ -36,6 +38,7 @@ export type {
   ArchiveThreadInput,
   CreateThreadInput,
   DeleteThreadInput,
+  ForkThreadInput, // [thread-fork]
   InterruptThreadTurnInput,
   RespondToThreadApprovalInput,
   RespondToThreadUserInputInput,
@@ -67,6 +70,13 @@ export function createThreadEnvironmentAtoms<R, E>(
     delete: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:delete",
       execute: (input: DeleteThreadInput) => deleteThread(input),
+      scheduler,
+      concurrency,
+    }),
+    // [thread-fork]
+    fork: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:fork",
+      execute: (input: ForkThreadInput) => forkThread(input),
       scheduler,
       concurrency,
     }),

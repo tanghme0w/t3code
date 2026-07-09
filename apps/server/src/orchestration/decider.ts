@@ -245,6 +245,62 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.fork": {
+      const sourceThread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.sourceThreadId,
+      });
+      yield* requireThreadAbsent({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // Two events on the NEW thread's stream: a regular thread.created (so
+      // every existing projector/reactor treats the fork as a normal thread)
+      // followed by thread.forked, whose projection copies the source
+      // history into the new thread and whose reactor seeds the provider
+      // resume cursor.
+      return [
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.created" as const,
+          payload: {
+            threadId: command.threadId,
+            projectId: sourceThread.projectId,
+            title: command.title ?? `${sourceThread.title} (fork)`,
+            modelSelection: sourceThread.modelSelection,
+            runtimeMode: sourceThread.runtimeMode,
+            interactionMode: sourceThread.interactionMode,
+            branch: sourceThread.branch,
+            worktreePath: sourceThread.worktreePath,
+            createdAt: command.createdAt,
+            updatedAt: command.createdAt,
+          },
+        },
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.forked" as const,
+          payload: {
+            threadId: command.threadId,
+            sourceThreadId: command.sourceThreadId,
+            atTurnId: command.atTurnId,
+            createdAt: command.createdAt,
+          },
+        },
+      ];
+    }
+
     case "thread.delete": {
       yield* requireThread({
         readModel,

@@ -119,6 +119,34 @@ interface ClaudeResumeState {
   readonly resume?: string;
   readonly resumeSessionAt?: string;
   readonly turnCount?: number;
+  /**
+   * [thread-fork] One-shot: resume the source session as a fork (new session
+   * id). Consumed at spawn; updateResumeCursor never re-persists it.
+   */
+  readonly forkSession?: boolean;
+  /**
+   * [thread-fork] Per-turn provider anchors (last assistant message uuid of
+   * each completed turn), enabling fork/rewind at an arbitrary turn.
+   */
+  readonly turnAnchors?: ReadonlyArray<ClaudeTurnAnchor>;
+}
+
+interface ClaudeTurnAnchor {
+  readonly turnId: string;
+  readonly uuid: string;
+}
+
+function readClaudeTurnAnchors(value: unknown): Array<ClaudeTurnAnchor> {
+  if (!Array.isArray(value)) return [];
+  const anchors: Array<ClaudeTurnAnchor> = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const anchor = entry as { turnId?: unknown; uuid?: unknown };
+    if (typeof anchor.turnId === "string" && typeof anchor.uuid === "string") {
+      anchors.push({ turnId: anchor.turnId, uuid: anchor.uuid });
+    }
+  }
+  return anchors;
 }
 
 interface ClaudeTurnState {
@@ -200,6 +228,7 @@ interface ClaudeSessionContext {
   lastKnownTotalProcessedTokens: number | undefined;
   lastAssistantUuid: string | undefined;
   lastThreadStartedId: string | undefined;
+  turnAnchors: Array<ClaudeTurnAnchor>; // [thread-fork]
   stopped: boolean;
 }
 
@@ -572,6 +601,8 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
     sessionId?: unknown;
     resumeSessionAt?: unknown;
     turnCount?: unknown;
+    forkSession?: unknown; // [thread-fork]
+    turnAnchors?: unknown; // [thread-fork]
   };
 
   const threadIdCandidate = typeof cursor.threadId === "string" ? cursor.threadId : undefined;
@@ -590,6 +621,8 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
     typeof cursor.resumeSessionAt === "string" ? cursor.resumeSessionAt : undefined;
   const turnCountValue = typeof cursor.turnCount === "number" ? cursor.turnCount : undefined;
 
+  const turnAnchors = readClaudeTurnAnchors(cursor.turnAnchors); // [thread-fork]
+
   return {
     ...(threadId ? { threadId } : {}),
     ...(resume ? { resume } : {}),
@@ -597,6 +630,8 @@ function readClaudeResumeState(resumeCursor: unknown): ClaudeResumeState | undef
     ...(turnCountValue !== undefined && Number.isInteger(turnCountValue) && turnCountValue >= 0
       ? { turnCount: turnCountValue }
       : {}),
+    ...(cursor.forkSession === true ? { forkSession: true } : {}), // [thread-fork]
+    ...(turnAnchors.length > 0 ? { turnAnchors } : {}), // [thread-fork]
   };
 }
 
@@ -1459,6 +1494,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
       ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
       turnCount: context.turns.length,
+      // [thread-fork] per-turn anchors let thread.fork resume at any turn.
+      ...(context.turnAnchors.length > 0 ? { turnAnchors: [...context.turnAnchors] } : {}),
     };
 
     context.session = {
@@ -2031,6 +2068,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       id: turnState.turnId,
       items: [...turnState.items],
     });
+    // [thread-fork] anchor this turn to the provider-side message uuid so a
+    // later thread.fork can resume exactly here.
+    if (context.lastAssistantUuid) {
+      context.turnAnchors.push({ turnId: turnState.turnId, uuid: context.lastAssistantUuid });
+      yield* updateResumeCursor(context);
+    }
 
     yield* emitThreadTokenUsage(context, usageSnapshot, {
       rawMethod: "claude/result",
@@ -3467,6 +3510,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(Object.keys(settings).length > 0 ? { settings } : {}),
         ...(existingResumeSessionId ? { resume: existingResumeSessionId } : {}),
         ...(newSessionId ? { sessionId: newSessionId } : {}),
+        // [thread-fork] one-shot: fork the resumed session to a new session id.
+        ...(existingResumeSessionId && resumeState?.forkSession ? { forkSession: true } : {}),
         includePartialMessages: true,
         canUseTool,
         env: agentHub.env(threadId, claudeEnvironment), // [agent-hub]
@@ -3566,6 +3611,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         lastKnownTotalProcessedTokens: undefined,
         lastAssistantUuid: resumeState?.resumeSessionAt,
         lastThreadStartedId: undefined,
+        turnAnchors: [...(resumeState?.turnAnchors ?? [])], // [thread-fork]
         stopped: false,
       };
       yield* Ref.set(contextRef, context);
