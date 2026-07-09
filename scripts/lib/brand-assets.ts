@@ -1,5 +1,9 @@
 export const BRAND_ASSET_PATHS = {
-  productionMacIconPng: "assets/prod/black-macos-1024.png",
+  // [agent-hub] rebrand — mac app icon: minimalist hub mark (was black-macos-1024.png).
+  // This PNG is the real source the mac build converts to icns via sips/iconutil,
+  // AND it is staged into the asar as resources/icon.png (loaded at runtime by
+  // DesktopAppIdentity.setDockIcon). resources/icon.{png,icns} are NOT build inputs.
+  productionMacIconPng: "assets/prod/agent-hub-macos-1024.png",
   productionLinuxIconPng: "assets/prod/black-universal-1024.png",
   productionWindowsIconIco: "assets/prod/t3-black-windows.ico",
   productionWebFaviconIco: "assets/prod/t3-black-web-favicon.ico",
