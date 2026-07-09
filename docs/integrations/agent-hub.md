@@ -111,20 +111,42 @@ must be running before threads use gateway models.
 
 ## Desktop identity on this branch
 
-This branch's desktop build is rebranded **Agent Hub Code** so it installs
-and runs alongside the official T3 Code (Alpha) without colliding on
-Launch Services, the Electron single-instance lock, or
-`~/Library/Application Support` (all keyed off the product name / appId):
+This branch's desktop build is rebranded **Agent Hub Code** and is fully
+state-decoupled from a canonical t3code install — both apps can be
+installed and **run at the same time** without touching each other:
+
+| Surface                  | canonical t3code               | this fork                              |
+| ------------------------ | ------------------------------ | -------------------------------------- |
+| Bundle / Launch Services | `com.t3tools.t3code`           | `com.agenthub.code`                    |
+| Server state root        | `~/.t3` (`T3CODE_HOME`)        | `~/.agent-hub-code`                    |
+| Electron userData        | `…/Application Support/t3code` | `…/Application Support/agent-hub-code` |
+| Keychain item            | "t3code Safe Storage"          | "Agent Hub Code Safe Storage"          |
+| OS URL scheme            | `t3code://`                    | `agent-hub-code://`                    |
+| Backend port             | scans up from 3773             | same scan — first free port wins       |
+
+Where each knob lives (all hooks carry the `[agent-hub]` anchor):
 
 - `apps/desktop/package.json` `productName: "Agent Hub Code"`
 - `scripts/build-desktop-artifact.ts` `DESKTOP_APP_ID: com.agenthub.code`,
-  artifact `Agent-Hub-Code-<version>-<arch>.dmg`
-- `apps/desktop/src/app/DesktopEnvironment.ts` `APP_BASE_NAME` (in-app name)
+  artifact `Agent-Hub-Code-<version>-<arch>.dmg`, stage `package.json`
+  `name`/`productName` (Electron `app.name` — this names the Chromium
+  keychain item), `protocols` (the OS scheme claim)
+- `apps/desktop/src/app/DesktopEnvironment.ts` `APP_BASE_NAME` (in-app
+  name), `FORK_STATE_DIR_NAME` (server state root fallback),
+  `FORK_USER_DATA_DIR_NAME` (Chromium profile dir)
 - `scripts/lib/brand-assets.ts` `productionMacIconPng` →
   `assets/prod/agent-hub-macos-1024.png` — the minimalist hub mark (ink
   squircle, white hub-and-spokes, one accent-blue node)
 
-All hooks carry the `[agent-hub] rebrand` anchor.
+The dev stack is deliberately **not** moved: dev-runner exports
+`T3CODE_HOME=~/.t3`, so dev state stays in `~/.t3/dev`; only the packaged
+fork reaches the `~/.agent-hub-code` fallback. The in-process renderer
+scheme (`t3code://app`) is per-app and unchanged — only the OS-level
+registration is forked, and nothing handles `open-url` today. The
+gateway-flagged `claude_hub` instance lives in
+`~/.agent-hub-code/userdata/settings.json` with its isolated Claude HOME
+at `~/.agent-hub-code/claude-hub-home`; a canonical `~/.t3` knows nothing
+about it.
 
 ### App icon: change the right file
 
@@ -151,8 +173,7 @@ the `.app` lands in the kept temp stage under
 /Applications (no quarantine attr on a local build). A full dmg is only
 needed for distribution.
 
-One caveat both apps share: the **server** state dir is `~/.t3` regardless
-of the Electron identity, so threads/projects/settings are common. Don't
-run both apps at the same time, and note the official build shows a
-gateway-flagged Claude instance as a plain erroring one (it lacks the
-integration code).
+Keychain note: the fork creates its own "Agent Hub Code Safe Storage" item
+silently on first launch, but ad-hoc signed builds get a new code signature
+every rebuild, so macOS re-prompts keychain access after each reinstall
+unless you pick "Always Allow".
