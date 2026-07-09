@@ -120,12 +120,36 @@ Launch Services, the Electron single-instance lock, or
 - `scripts/build-desktop-artifact.ts` `DESKTOP_APP_ID: com.agenthub.code`,
   artifact `Agent-Hub-Code-<version>-<arch>.dmg`
 - `apps/desktop/src/app/DesktopEnvironment.ts` `APP_BASE_NAME` (in-app name)
-- `apps/desktop/resources/icon.icns` / `icon.png` — minimalist hub mark
-  (ink squircle, white hub-and-spokes, one accent-blue node)
+- `scripts/lib/brand-assets.ts` `productionMacIconPng` →
+  `assets/prod/agent-hub-macos-1024.png` — the minimalist hub mark (ink
+  squircle, white hub-and-spokes, one accent-blue node)
 
-All hooks carry the `[agent-hub] rebrand` anchor. Install: mount the dmg
-and copy "Agent Hub Code.app" into /Applications (no quarantine attr on a
-local build).
+All hooks carry the `[agent-hub] rebrand` anchor.
+
+### App icon: change the right file
+
+The mac icon has **one** real source: the 1024×1024 PNG named by
+`brand-assets.ts` `productionMacIconPng`. At build time
+`scripts/build-desktop-artifact.ts` (`stageMacIcons`) turns it into **both**
+the bundle `icon.icns` **and** the asar's `resources/icon.png`. Editing
+`apps/desktop/resources/icon.{icns,png}` in the repo does nothing — those are
+regenerated into the build stage and overwritten. Regenerate the master with
+`assets/prod/agent-hub-icon.gen.swift` instead (it renders an iconset; its
+`icon_512x512@2x.png` is the committed 1024 master).
+
+The runtime gotcha behind that: on macOS `DesktopAppIdentity.configure`
+calls `app.dock.setIcon(iconPaths.png)`, resolving `icon.png` from
+`resolveResourcePathCandidates` — first hit is **inside the asar**
+(`app.asar/resources/icon.png`), which overrides the bundle `.icns` a
+moment after launch. So a bundle-icns-only change makes the correct icon
+flash and then revert to whatever PNG is packed in the asar. Both must come
+from the same brand PNG, which is why the single-source pipeline matters.
+
+Install: build the app (a plain `--target dir --keep-stage` build is enough;
+the `.app` lands in the kept temp stage under
+`$TMPDIR/t3code-desktop-mac-stage-*/app/dist/mac-arm64/`) and `ditto` it into
+/Applications (no quarantine attr on a local build). A full dmg is only
+needed for distribution.
 
 One caveat both apps share: the **server** state dir is `~/.t3` regardless
 of the Electron identity, so threads/projects/settings are common. Don't
