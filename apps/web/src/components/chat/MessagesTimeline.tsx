@@ -46,11 +46,13 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
+  GitForkIcon, // [thread-fork]
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
   MousePointerClickIcon,
   PaintbrushIcon,
+  PencilIcon, // [thread-fork]
   MinusIcon,
   SquarePenIcon,
   TerminalIcon,
@@ -130,6 +132,16 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
+  // [thread-fork]
+  onForkFromMessage: (input: {
+    readonly messageId: MessageId;
+    readonly prefillText: string;
+  }) => void;
+  // [thread-fork]
+  onEditUserMessage: (input: {
+    readonly messageId: MessageId;
+    readonly prefillText: string;
+  }) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -165,6 +177,16 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
+  // [thread-fork]
+  onForkFromMessage: (input: {
+    readonly messageId: MessageId;
+    readonly prefillText: string;
+  }) => void;
+  // [thread-fork]
+  onEditUserMessage: (input: {
+    readonly messageId: MessageId;
+    readonly prefillText: string;
+  }) => void;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -198,6 +220,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
+  onForkFromMessage, // [thread-fork]
+  onEditUserMessage, // [thread-fork]
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -417,6 +441,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onForkFromMessage, // [thread-fork]
+      onEditUserMessage, // [thread-fork]
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -431,6 +457,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onForkFromMessage, // [thread-fork]
+      onEditUserMessage, // [thread-fork]
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -918,6 +946,17 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             </TooltipPopup>
           </Tooltip>
           <div className="flex items-center gap-0.5">
+            {/* [thread-fork] */}
+            <ForkFromMessageButton
+              messageId={row.message.id}
+              prefillText={displayedUserMessage.copyText ?? ""}
+            />
+            {canRevertAgentWork && (
+              <EditUserMessageButton
+                messageId={row.message.id}
+                prefillText={displayedUserMessage.copyText ?? ""}
+              />
+            )}
             {canRevertAgentWork && <RevertUserMessageButton messageId={row.message.id} />}
             {displayedUserMessage.copyText && (
               <MessageCopyButton text={displayedUserMessage.copyText} variant="ghost" />
@@ -926,6 +965,72 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
         </div>
       </div>
     </div>
+  );
+}
+
+// [thread-fork] Fork the thread at this message: the new thread carries the
+// history before it and the composer is prefilled with its text.
+function ForkFromMessageButton({
+  messageId,
+  prefillText,
+}: {
+  messageId: MessageId;
+  prefillText: string;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={activity.isRevertingCheckpoint}
+            onClick={() => ctx.onForkFromMessage({ messageId, prefillText })}
+            aria-label="Fork thread from here"
+          />
+        }
+      >
+        <GitForkIcon className="size-3" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Fork thread from here</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+// [thread-fork] Edit & resend: prefill the composer with this message and
+// revert the thread to just before it.
+function EditUserMessageButton({
+  messageId,
+  prefillText,
+}: {
+  messageId: MessageId;
+  prefillText: string;
+}) {
+  const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={activity.isRevertingCheckpoint || activity.isWorking}
+            onClick={() => ctx.onEditUserMessage({ messageId, prefillText })}
+            aria-label="Edit and resend"
+          />
+        }
+      >
+        <PencilIcon className="size-3" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Edit &amp; resend</TooltipPopup>
+    </Tooltip>
   );
 }
 

@@ -233,6 +233,7 @@ import {
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
+  waitForServerThreadExists, // [thread-fork]
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -1024,6 +1025,7 @@ function ChatViewContent(props: ChatViewProps) {
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
     reportFailure: false,
   });
+  const forkThread = useAtomCommand(threadEnvironment.fork, { reportFailure: false }); // [thread-fork]
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
   const { environments } = useEnvironments();
@@ -4909,6 +4911,84 @@ function ChatViewContent(props: ChatViewProps) {
     void onRevertToTurnCountRef.current(targetTurnCount);
   }, []);
 
+  // [thread-fork] Fork the thread at a user message: the new thread carries
+  // the history BEFORE that message (provider session forks server-side) and
+  // the composer is prefilled with the message text for tweaking. User
+  // message rows carry no turnId in projections; the cut turn is the next
+  // assistant message's turn in the timeline (none → fork at tip).
+  const onForkFromMessage = useCallback(
+    (input: { readonly messageId: MessageId; readonly prefillText: string }) => {
+      void (async () => {
+        if (!activeThread) return;
+        let cutTurnId: TurnId | null = null;
+        const entryIndex = timelineEntries.findIndex(
+          (entry) => entry.kind === "message" && entry.message.id === input.messageId,
+        );
+        for (let index = entryIndex; index >= 0 && index < timelineEntries.length; index += 1) {
+          const entry = timelineEntries[index];
+          if (!entry || entry.kind !== "message") continue;
+          if (entry.message.turnId !== null) {
+            cutTurnId = entry.message.turnId;
+            break;
+          }
+        }
+        const forkEnvironmentId = activeThread.environmentId;
+        const nextThreadId = newThreadId();
+        const result = await forkThread({
+          environmentId: forkEnvironmentId,
+          input: {
+            threadId: nextThreadId,
+            sourceThreadId: activeThread.id,
+            atTurnId: cutTurnId,
+          },
+        });
+        if (result._tag === "Failure") {
+          if (!isAtomCommandInterrupted(result)) {
+            const error = squashAtomCommandFailure(result);
+            setThreadError(
+              activeThread.id,
+              error instanceof Error ? error.message : "Failed to fork thread.",
+            );
+          }
+          return;
+        }
+        const forkRef = scopeThreadRef(forkEnvironmentId, nextThreadId);
+        if (input.prefillText.length > 0) {
+          setComposerDraftPrompt(forkRef, input.prefillText);
+        }
+        // Wait for the client subscription to see the forked thread before
+        // navigating, else the route guard races it and bounces to "/".
+        await waitForServerThreadExists(forkRef);
+        await navigate({
+          to: "/$environmentId/$threadId",
+          params: { environmentId: forkEnvironmentId, threadId: nextThreadId },
+        });
+      })();
+    },
+    [activeThread, forkThread, navigate, setComposerDraftPrompt, setThreadError, timelineEntries],
+  );
+
+  // [thread-fork] Edit & resend: prefill the composer with the message text,
+  // then revert the thread to just before that message (confirm dialog and
+  // busy-state guards live in onRevertToTurnCount).
+  const onEditUserMessage = useCallback(
+    (input: { readonly messageId: MessageId; readonly prefillText: string }) => {
+      const targetTurnCount = revertTurnCountRef.current.get(input.messageId);
+      if (typeof targetTurnCount !== "number") {
+        return;
+      }
+      promptRef.current = input.prefillText;
+      setComposerDraftPrompt(composerDraftTarget, input.prefillText);
+      composerRef.current?.resetCursorState({
+        cursor: collapseExpandedComposerCursor(input.prefillText, input.prefillText.length),
+        prompt: input.prefillText,
+        detectTrigger: true,
+      });
+      void onRevertToTurnCountRef.current(targetTurnCount);
+    },
+    [composerDraftTarget, setComposerDraftPrompt],
+  );
+
   // Empty state: no active thread
   if (!activeThread) {
     return <NoActiveThreadState />;
@@ -5088,6 +5168,8 @@ function ChatViewContent(props: ChatViewProps) {
                 onOpenTurnDiff={onOpenTurnDiff}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                 onRevertUserMessage={onRevertUserMessage}
+                onForkFromMessage={onForkFromMessage} // [thread-fork]
+                onEditUserMessage={onEditUserMessage} // [thread-fork]
                 isRevertingCheckpoint={isRevertingCheckpoint}
                 onImageExpand={onExpandTimelineImage}
                 markdownCwd={gitCwd ?? undefined}

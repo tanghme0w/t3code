@@ -44,6 +44,7 @@ import { ProjectionThreadSessionRepositoryLive } from "../../persistence/Layers/
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { ProjectionThreadRepositoryLive } from "../../persistence/Layers/ProjectionThreads.ts";
 import { ServerConfig } from "../../config.ts";
+import { applyThreadForkProjection } from "./ThreadForkProjection.ts"; // [thread-fork]
 import {
   OrchestrationProjectionPipeline,
   type OrchestrationProjectionPipelineShape,
@@ -593,6 +594,17 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       "applyThreadsProjection",
     )(function* (event, attachmentSideEffects) {
       switch (event.type) {
+        // [thread-fork] history clone is owned by ThreadForkProjection.
+        case "thread.forked":
+          yield* applyThreadForkProjection({
+            threads: projectionThreadRepository,
+            messages: projectionThreadMessageRepository,
+            turns: projectionTurnRepository,
+            activities: projectionThreadActivityRepository,
+            refreshThreadShellSummary,
+          })(event);
+          return;
+
         case "thread.created":
           yield* projectionThreadRepository.upsert({
             threadId: event.payload.threadId,
