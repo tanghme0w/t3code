@@ -1,7 +1,8 @@
 # agent-hub fork notes
 
-This branch (`agent-hub-multiprovider`) is agent-hub's t3code fork. Since
-2026-07-10 it carries exactly **two** deltas over upstream:
+This repo's `main` is agent-hub's t3code fork line (merged from the
+`agent-hub-multiprovider` branch on 2026-07-10; the branch remains as a
+historical alias). It carries exactly **two** deltas over upstream:
 
 1. **Thread fork / edit-and-resend** — event-sourced thread forking that
    also forks the Claude provider session (the agent's memory), plus an
@@ -40,7 +41,8 @@ grep -rn '\[agent-hub\]' apps scripts
 
 ## Rebasing onto upstream t3code
 
-1. `git fetch origin && git rebase origin/main`.
+1. `git fetch origin && git rebase origin/main` (from the local `main`;
+   `origin/main` is upstream pingdotgg/t3code).
 2. Conflicts can only occur on the anchored hook lines — re-apply them
    around the moved code; the new files never conflict.
 3. Re-verify: the greps above; `pnpm --dir apps/server run typecheck`;
