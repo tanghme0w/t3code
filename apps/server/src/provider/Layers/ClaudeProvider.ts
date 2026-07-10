@@ -267,6 +267,27 @@ const BUILT_IN_MODELS: ReadonlyArray<ServerProviderModel> = [
   },
 ];
 
+/**
+ * Parse the Claude Code version from `claude --version` output.
+ *
+ * Wrapped distributions print the wrapper's own version first and the bundled
+ * Claude Code version on a later `@anthropic-ai/claude-code <version>` line,
+ * e.g. Tencent's tclaude:
+ *
+ *     @tencent/tclaude 0.0.9
+ *       commit: d0cec24547e
+ *       built:  2026-07-06 16:17:07
+ *     @anthropic-ai/claude-code 2.1.154
+ *
+ * Model gating must key off the bundled Claude Code version, not the
+ * wrapper's, so prefer that line and only fall back to the first generic
+ * version token (official builds print a single `2.1.205 (Claude Code)` line).
+ */
+function parseClaudeCliVersion(output: string): string | null {
+  const bundled = output.match(/@anthropic-ai\/claude-code[^\S\n]+v?(\d+\.\d+\.\d+)/i);
+  return bundled?.[1] ?? parseGenericCliVersion(output);
+}
+
 function supportsClaudeFable5(version: string | null | undefined): boolean {
   return version ? compareSemverVersions(version, MINIMUM_CLAUDE_FABLE_5_VERSION) >= 0 : false;
 }
@@ -481,7 +502,7 @@ function claudeAuthMetadata(input: {
 
 // ── SDK capability probe ────────────────────────────────────────────
 
-const CAPABILITIES_PROBE_TIMEOUT_MS = 8_000;
+const CAPABILITIES_PROBE_TIMEOUT_MS = 15_000;
 
 function nonEmptyProbeString(value: string): string | undefined {
   const candidate = value.trim();
@@ -628,9 +649,18 @@ const probeClaudeCapabilities = (
     ),
     Effect.timeoutOption(CAPABILITIES_PROBE_TIMEOUT_MS),
     Effect.result,
-    Effect.map((result) => {
-      if (Result.isFailure(result)) return undefined;
-      return Option.isSome(result.success) ? result.success.value : undefined;
+    Effect.flatMap((result) => {
+      if (Result.isFailure(result)) {
+        return Effect.logWarning("Claude capabilities probe failed.", {
+          cause: result.failure,
+        }).pipe(Effect.as(undefined));
+      }
+      if (Option.isNone(result.success)) {
+        return Effect.logWarning("Claude capabilities probe timed out.", {
+          timeoutMs: CAPABILITIES_PROBE_TIMEOUT_MS,
+        }).pipe(Effect.as(undefined));
+      }
+      return Effect.succeed<ClaudeCapabilitiesProbe | undefined>(result.success.value);
     }),
   );
 };
@@ -733,7 +763,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   }
 
   const version = versionProbe.success.value;
-  const parsedVersion = parseGenericCliVersion(`${version.stdout}\n${version.stderr}`);
+  const parsedVersion = parseClaudeCliVersion(`${version.stdout}\n${version.stderr}`);
   if (version.code !== 0) {
     yield* Effect.logWarning("Claude Agent CLI version probe exited with a non-zero status.", {
       exitCode: version.code,
@@ -776,6 +806,12 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
   const dedupedSlashCommands = dedupeSlashCommands(slashCommands);
 
   if (!capabilities) {
+    // The CLI itself is installed and runs; failing to read account metadata
+    // must not block the provider (pickers require status "ready"), so keep
+    // it usable and surface the unverified auth as informational.
+    yield* Effect.logWarning(
+      "Claude capabilities probe returned no data; keeping provider available with unverified auth.",
+    );
     return buildServerProvider({
       presentation: CLAUDE_PRESENTATION,
       enabled: claudeSettings.enabled,
@@ -785,7 +821,7 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
       probe: {
         installed: true,
         version: parsedVersion,
-        status: "warning",
+        status: "ready",
         auth: { status: "unknown" },
         message: "Could not verify Claude authentication status from initialization result.",
       },
