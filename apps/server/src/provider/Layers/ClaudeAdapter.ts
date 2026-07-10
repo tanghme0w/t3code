@@ -70,7 +70,6 @@ import * as Stream from "effect/Stream";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
-import { agentHubAdapterHooks, type AgentHubInstanceIntegration } from "../agentHubGateway.ts"; // [agent-hub]
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import {
   getClaudeModelCapabilities,
@@ -250,8 +249,6 @@ export interface ClaudeAdapterLiveOptions {
   }) => ClaudeQueryRuntime;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
-  /** [agent-hub] Present when the instance routes through agent-hub's gateway (ClaudeDriver detects the marker env). */
-  readonly agentHubGateway?: AgentHubInstanceIntegration;
 }
 
 function isUuid(value: string): boolean {
@@ -1385,7 +1382,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   const claudeEnvironment = yield* makeClaudeEnvironment(claudeSettings, options?.environment).pipe(
     Effect.provideService(Path.Path, path),
   );
-  const agentHub = agentHubAdapterHooks(options?.agentHubGateway); // [agent-hub] inert without opt-in
   const nativeEventLogger =
     options?.nativeEventLogger ??
     (options?.nativeEventLogPath !== undefined
@@ -3486,9 +3482,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(fastMode ? { fastMode: true } : {}),
         ...(ultracode ? { ultracode: true } : {}),
       };
-      // [agent-hub] Route must exist before the process's first API call.
-      yield* agentHub.syncRouteBestEffort(threadId, apiModelId, input.cwd);
-
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
@@ -3514,7 +3507,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(existingResumeSessionId && resumeState?.forkSession ? { forkSession: true } : {}),
         includePartialMessages: true,
         canUseTool,
-        env: agentHub.env(threadId, claudeEnvironment), // [agent-hub]
+        env: claudeEnvironment,
         ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
         ...(mcpSession
@@ -3722,13 +3715,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...context.session,
         model: modelSelection.model,
       };
-      // [agent-hub] Matrix slugs re-point the gateway route before the prompt
-      // is queued; failing silently would run the turn on the old provider.
-      yield* agentHub
-        .syncRoute(input.threadId, apiModelId, context.session.cwd, { fallbackToDefault: false })
-        .pipe(
-          Effect.mapError((cause) => toRequestError(input.threadId, "turn/agentHubRoute", cause)),
-        );
     }
 
     // Apply interaction mode by switching the SDK's permission mode.
