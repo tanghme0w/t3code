@@ -1,70 +1,52 @@
-# agent-hub gateway integration
+# agent-hub fork notes
 
-This branch integrates [agent-hub](../../..)'s per-session multiprovider
-routing gateway into the Claude provider. A Claude provider instance that
-declares the marker variable `AGENT_HUB_GATEWAY_URL` in its per-instance
-environment gets:
+This branch (`agent-hub-multiprovider`) is agent-hub's t3code fork. Since
+2026-07-10 it carries exactly **two** deltas over upstream:
 
-- the gateway's full provider×model catalog appended to its model list
-  (picker slugs of the form `<provider>/<model>`, grouped by `subProvider`);
-- per-thread routing: each thread's `claude` process is spawned with
-  `ANTHROPIC_BASE_URL=<gateway>/s/t3-<threadId>`;
-- mid-conversation provider/model switching: selecting a matrix model
-  re-points the gateway route table before the prompt is queued — the
-  running process picks the new upstream up on its next API request, no
-  respawn, across vendors.
+1. **Thread fork / edit-and-resend** — event-sourced thread forking that
+   also forks the Claude provider session (the agent's memory), plus an
+   "edit & resend" action. User guide: [thread-history](../user/thread-history.md).
+2. **A separate desktop identity** — the packaged app is "Agent Hub Code"
+   and shares no state with a canonical t3code install (details below).
 
-Instances without the marker are untouched; every integration code path is
-inert for them.
-
-## Configuration
-
-On a Claude provider instance (Settings → Providers, or
-`providerInstances.<id>` in the server settings file):
-
-| Environment variable      | Meaning                                                                                                                                                   |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AGENT_HUB_GATEWAY_URL`   | Opt-in marker + gateway base URL, e.g. `http://127.0.0.1:8484`                                                                                            |
-| `AGENT_HUB_GATEWAY_TOKEN` | Optional. Gateway internal-API token; falls back to `~/.agent-hub/secrets.json` (`internal_gateway_token`) since both run on the same machine             |
-| `AGENT_HUB_DEFAULT_ROUTE` | Optional. `provider/model` used for the instance session (probes, text generation) and as the session-start fallback; defaults to the first catalog entry |
-
-The instance should also set an isolated `Claude HOME path` so a cached
-Anthropic login can't shadow the gateway env, and a `Binary path` to a real
-`claude` executable. Run the gateway from the agent-hub repo:
-`bun run packages/gateway/src/index.ts`.
+The original reason for the fork — the agent-hub **gateway multiprovider
+integration** — was removed on 2026-07-10: canonical t3code now handles
+multi-vendor models natively, so the per-session routing gateway is no
+longer needed here. The full wiring survives in git history if it is ever
+wanted again: added in `ee0333a40`, decoupled behind seams in `14086c975`,
+removed in the commit that rewrote this file. The agent-hub repo still
+ships the gateway itself (route A); this branch just no longer uses it.
 
 ## Code layout & upstream seams
 
-All integration logic lives in **one module**:
-`apps/server/src/provider/agentHubGateway.ts` (plus its unit tests in
-`agentHubGateway.test.ts`). Upstream files call it only at hook lines
-anchored with a `[agent-hub]` comment:
+Every fork change is anchored so upstream rebases stay mechanical:
 
-| File                               | Hooks                                                                                                                                                                                   |
-| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider/Drivers/ClaudeDriver.ts` | import; `initAgentHubInstance` (env + default route); `agentHubGateway` adapter option; `withAgentHubGatewayModels` in the two snapshot pipes                                           |
-| `provider/Layers/ClaudeAdapter.ts` | import; `agentHubGateway` field on `ClaudeAdapterLiveOptions`; `agentHubAdapterHooks` at the adapter head; `syncRouteBestEffort` + `env()` in `startSession`; `syncRoute` in `sendTurn` |
+| Anchor          | Scope                                                                                                                                                                                                                                                                              |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[thread-fork]` | Fork/edit feature. Hook lines in `apps/server/src/server.ts`, `provider/Layers/ClaudeAdapter.ts` (resume cursor: `forkSession`, `turnAnchors`), `packages/client-runtime` (command plumbing), `apps/web/src/components/ChatView.tsx` + `chat/MessagesTimeline.tsx` (hover actions) |
+| `[agent-hub]`   | Desktop identity fork only (rebrand + state decoupling) — `apps/desktop/*`, `scripts/build-desktop-artifact.ts`, `scripts/lib/brand-assets.ts`                                                                                                                                     |
 
-Audit the seams after any upstream sync:
+Wholly new files (never conflict): `orchestration/Layers/ThreadForkProjection.ts`,
+`orchestration/Layers/ThreadForkReactor.ts`, `orchestration/Services/ThreadForkReactor.ts`,
+plus additive command/event entries in `packages/contracts/src/orchestration.ts`
+and a `thread.fork` case in `orchestration/decider.ts`.
+
+Audit after any upstream sync:
 
 ```sh
-grep -rn '\[agent-hub\]' apps/server/src
+grep -rn '\[thread-fork\]' apps packages
+grep -rn '\[agent-hub\]' apps scripts
 ```
 
 ## Rebasing onto upstream t3code
 
-1. `git fetch origin && git rebase origin/main` (this branch:
-   `agent-hub-multiprovider`).
-2. Conflicts can only occur on the anchored hook lines above — re-apply
-   them around the moved code; the module itself never conflicts.
-3. Re-verify: the grep above shows all hooks;
-   `pnpm --dir apps/server run typecheck`;
-   `vp test run agentHubGateway ClaudeAdapter` from `apps/server`.
-4. Live smoke test: start the agent-hub gateway + `bun run dev`, open the
-   picker on a gateway-flagged instance (matrix models present), send a
-   message, switch to a different provider's model mid-thread, and confirm
-   the route flip in agent-hub's sqlite:
-   `sqlite3 ~/.agent-hub/hub.sqlite "SELECT id, current_route_provider, current_route_model FROM sessions WHERE id LIKE 't3-%';"`
+1. `git fetch origin && git rebase origin/main`.
+2. Conflicts can only occur on the anchored hook lines — re-apply them
+   around the moved code; the new files never conflict.
+3. Re-verify: the greps above; `pnpm --dir apps/server run typecheck`;
+   `vp test run ClaudeAdapter ThreadFork OrchestrationReactor` from
+   `apps/server`; fork a thread in the UI and check the new thread replays
+   history and remembers pre-fork context.
 
 ## Running & packaging (this network / machine)
 
@@ -74,9 +56,6 @@ Dev stack (server :13773 + web :5733; pair via the URL the server logs):
 # once: deps — the default npm registry here (mirrors.tencent.com) is
 # flaky for some tarballs; pin the official one
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 pnpm install --registry=https://registry.npmjs.org/
-
-# every session: the gateway first, from the agent-hub repo root
-bun run packages/gateway/src/index.ts
 
 bun run dev
 ```
@@ -104,10 +83,9 @@ curl -sL -o "$MIR/dmg-builder@1.2.0/dmgbuild-bundle-arm64-75c8a6c.tar.gz" \
 ELECTRON_MIRROR="http://127.0.0.1:8099/" bun run dist:desktop:dmg:arm64
 ```
 
-The packaged app runs its own server against the _default_ `~/.t3`
-userdata (not the dev state in `~/.t3/dev`), so the gateway-flagged
-provider instance must be configured there too, and the agent-hub gateway
-must be running before threads use gateway models.
+Build via `bun run` / pnpm scripts, not bare `node` — the artifact script
+shells out to `vp`, which only resolves from `node_modules/.bin`
+(`spawn vp ENOENT` otherwise).
 
 ## Desktop identity on this branch
 
@@ -142,11 +120,7 @@ The dev stack is deliberately **not** moved: dev-runner exports
 `T3CODE_HOME=~/.t3`, so dev state stays in `~/.t3/dev`; only the packaged
 fork reaches the `~/.agent-hub-code` fallback. The in-process renderer
 scheme (`t3code://app`) is per-app and unchanged — only the OS-level
-registration is forked, and nothing handles `open-url` today. The
-gateway-flagged `claude_hub` instance lives in
-`~/.agent-hub-code/userdata/settings.json` with its isolated Claude HOME
-at `~/.agent-hub-code/claude-hub-home`; a canonical `~/.t3` knows nothing
-about it.
+registration is forked, and nothing handles `open-url` today.
 
 ### App icon: change the right file
 
