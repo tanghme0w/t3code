@@ -512,6 +512,34 @@ function runtimeEventToActivities(
       ];
     }
 
+    case "task.updated": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone:
+            event.payload.status === "failed" || event.payload.status === "killed"
+              ? "error"
+              : "info",
+          kind: "task.updated",
+          summary: event.payload.status ? `Task ${event.payload.status}` : "Task updated",
+          payload: {
+            taskId: event.payload.taskId,
+            ...(event.payload.status ? { status: event.payload.status } : {}),
+            ...(event.payload.description
+              ? { description: truncateDetail(event.payload.description) }
+              : {}),
+            ...(event.payload.error ? { error: truncateDetail(event.payload.error) } : {}),
+            ...(event.payload.isBackgrounded !== undefined
+              ? { isBackgrounded: event.payload.isBackgrounded }
+              : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "thread.state.changed": {
       if (event.payload.state !== "compacted") {
         return [];

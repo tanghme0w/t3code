@@ -1,4 +1,10 @@
-import { Maximize2Icon, Minimize2Icon, PanelBottomIcon, PanelRightIcon } from "lucide-react";
+import {
+  ListChecksIcon,
+  Maximize2Icon,
+  Minimize2Icon,
+  PanelBottomIcon,
+  PanelRightIcon,
+} from "lucide-react";
 import { memo } from "react";
 
 import { Toggle } from "../ui/toggle";
@@ -11,8 +17,11 @@ interface PanelLayoutControlsProps {
   rightPanelAvailable: boolean;
   rightPanelOpen: boolean;
   rightPanelShortcutLabel: string | null;
+  taskSummaryAvailable?: boolean;
+  taskSummaryOpen?: boolean;
   onToggleTerminal: () => void;
   onToggleRightPanel: () => void;
+  onToggleTaskSummary?: () => void;
 }
 
 export const PanelLayoutControls = memo(function PanelLayoutControls({
@@ -22,14 +31,36 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
   rightPanelAvailable,
   rightPanelOpen,
   rightPanelShortcutLabel,
+  taskSummaryAvailable = false,
+  taskSummaryOpen = false,
   onToggleTerminal,
   onToggleRightPanel,
+  onToggleTaskSummary,
 }: PanelLayoutControlsProps) {
   return (
     <div
       className="flex h-full shrink-0 items-center gap-1 [-webkit-app-region:no-drag]"
       data-panel-layout-controls
     >
+      {taskSummaryAvailable && onToggleTaskSummary ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Toggle
+                className="shrink-0 [-webkit-app-region:no-drag]"
+                pressed={taskSummaryOpen}
+                onPressedChange={onToggleTaskSummary}
+                aria-label="Toggle task summary"
+                variant="ghost"
+                size="sm"
+              >
+                <ListChecksIcon className="size-3.5" />
+              </Toggle>
+            }
+          />
+          <TooltipPopup side="bottom">Toggle task summary</TooltipPopup>
+        </Tooltip>
+      ) : null}
       <Tooltip>
         <TooltipTrigger
           render={
