@@ -1,4 +1,4 @@
-import { CheckIcon, CircleIcon, ListChecksIcon, Loader2Icon, PauseIcon, XIcon } from "lucide-react";
+import { CheckIcon, CircleIcon, LayersIcon, Loader2Icon, PauseIcon, XIcon } from "lucide-react";
 
 import { cn } from "~/lib/utils";
 import { isSettledTaskStatus, type ThreadTaskEntry, type ThreadTaskList } from "~/lib/taskList";
@@ -46,8 +46,8 @@ export function TaskListCard({ className, taskList }: TaskListCardProps) {
       )}
     >
       <div className="flex items-center gap-2 px-3.5 py-2.5">
-        <ListChecksIcon className="size-4 shrink-0 text-muted-foreground" />
-        <span className="text-sm font-medium">Tasks</span>
+        <LayersIcon className="size-4 shrink-0 text-muted-foreground" />
+        <span className="text-sm font-medium">Background tasks</span>
         <span
           className={cn(
             "ml-auto text-xs tabular-nums",

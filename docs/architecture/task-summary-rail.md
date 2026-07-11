@@ -1,16 +1,45 @@
 # Task summary rail
 
-A pinned right-hand rail beside the conversation column that shows the
-thread's harness-tracked tasks (subagents, background work) with live status —
-modeled on Codex's pinned-summary layout. When the rail is open the
-conversation column (timeline *and* composer) yields width and re-centers in
-the remaining space, mirroring the left sidebar as a three-column layout.
+A pinned right-hand rail beside the conversation column that summarizes the
+thread's work — the assistant's todo list (TodoWrite plan steps) first, then
+the harness-tracked background tasks (subagents, background commands) — with
+live status, modeled on Codex's pinned-summary layout. When the rail is open
+the conversation column (timeline _and_ composer) yields width and re-centers
+in the remaining space, mirroring the left sidebar as a three-column layout.
 There is never overlay/occlusion: the rail participates in the chat area's
 flex row.
+
+## Two "task" concepts
+
+Claude Code has two unrelated things that both sound like a task list; the
+rail shows both, on separate cards:
+
+- **Todo list** (`TodoWrite` tool, the `todo summary` mental model): the
+  assistant's plan checklist for the turn. The adapter parses TodoWrite tool
+  input into `turn.plan.updated` runtime events (`plan: [{ step, status }]`).
+  Surface: the rail's **To-dos** card (and the right-hand Plan panel).
+- **Harness task lifecycle** (`task_started/…/task_updated` system messages,
+  managed by the CLI's `TaskCreate/TaskUpdate/TaskList` tools): tracked
+  _background work_ — background shell commands, subagents, workflows. Their
+  `description` is typically the command line, which is why this card fills
+  with `cmd`s. Surface: the rail's **Background tasks** card.
 
 ## Data flow
 
 ```
+[todo card]
+Claude TodoWrite tool-input deltas
+  → ClaudeAdapter (input_json_delta)       apps/server/src/provider/Layers/ClaudeAdapter.ts
+      emits turn.plan.updated                payload.plan: [{ step, status }]
+  → runtimeEventToActivities               apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
+  → OrchestrationThread.activities         (persisted + replayed like any activity)
+  → deriveActivePlanState                  apps/web/src/session-logic.ts
+      latest plan of the current turn, falling back to the most recent turn
+      with a plan (already derived in ChatView for the Plan panel; the rail
+      reuses that value)
+  → TodoListCard                           apps/web/src/components/chat/TodoListCard.tsx
+
+[background-task card]
 Claude CLI system messages                 (task_started / task_progress /
                                             task_notification / task_updated)
   → ClaudeAdapter.handleSystemMessage      apps/server/src/provider/Layers/ClaudeAdapter.ts
@@ -42,15 +71,19 @@ Notes on the wire format:
 
 ## UI pieces
 
-- `useTaskSummaryRail(activities)` — derives the task list and holds the
-  pinned flag (default on). Returns `{ taskList, available, open, toggle }`.
+- `useTaskSummaryRail(activities, rightPanelOpen, activePlan)` — derives the
+  background-task list, passes the plan through, and holds the pinned flag
+  (default on). Returns `{ taskList, activePlan, available, open, toggle }`;
+  `available` is true when the thread has todos _or_ tasks.
 - `TaskSummaryRail` — the `<aside>` column (19.5rem, hidden on `max-sm`).
-- `TaskListCard` — the tasks card: status icons, progress bar, `n/m` counter,
-  live mid-task summaries, `bg` badge for backgrounded tasks.
+- `TodoListCard` — the To-dos card: TodoWrite plan steps with per-step status
+  icons, progress bar, `completed/total` counter.
+- `TaskListCard` — the Background-tasks card: status icons, progress bar,
+  `n/m` counter, live mid-task summaries, `bg` badge for backgrounded tasks.
 - The header's task-summary toggle lives in
   `apps/web/src/components/chat/PanelLayoutControls.tsx` behind optional
   props (`taskSummaryAvailable/taskSummaryOpen/onToggleTaskSummary`); it only
-  renders when the thread has tasks.
+  renders when the thread has todos or tasks.
 
 ## Adding another card to the rail
 
@@ -68,8 +101,10 @@ Notes on the wire format:
 ## Upstream-merge posture
 
 Everything rail-specific lives in fork-only files (`TaskSummaryRail.tsx`,
-`TaskListCard.tsx`, `lib/taskList.ts(+test)`, this doc). Shared files carry
-deliberately minimal diffs:
+`TaskListCard.tsx`, `TodoListCard.tsx`, `lib/taskList.ts(+test)`, this doc).
+The todo card deliberately reuses upstream's plan pipeline
+(`turn.plan.updated` → `deriveActivePlanState`) rather than adding transport.
+Shared files carry deliberately minimal diffs:
 
 - `packages/contracts/src/providerRuntime.ts` — `task.updated` event type +
   payload.
