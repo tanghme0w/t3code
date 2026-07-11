@@ -18,6 +18,7 @@ import {
   ProviderItemId,
   ProviderRuntimeEvent,
   type RuntimeMode,
+  RuntimeTaskId,
   ThreadId,
   ProviderInstanceId,
 } from "@t3tools/contracts";
@@ -1658,6 +1659,74 @@ describe("ClaudeAdapterLive", () => {
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(layer),
+    );
+  });
+
+  it.effect("maps task_updated patches into task.updated events", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "task-patch-1",
+        patch: {
+          status: "paused",
+          is_backgrounded: true,
+        },
+        session_id: "sdk-session-task-updated",
+        uuid: "task-updated-1",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "task-patch-2",
+        patch: {
+          status: "failed",
+          error: "exit code 1",
+        },
+        session_id: "sdk-session-task-updated",
+        uuid: "task-updated-2",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const updatedEvents = runtimeEvents.filter((event) => event.type === "task.updated");
+      assert.equal(updatedEvents.length, 2);
+      const [pausedEvent, failedEvent] = updatedEvents;
+      if (pausedEvent?.type === "task.updated") {
+        assert.deepEqual(pausedEvent.payload, {
+          taskId: RuntimeTaskId.make("task-patch-1"),
+          status: "paused",
+          isBackgrounded: true,
+        });
+      }
+      if (failedEvent?.type === "task.updated") {
+        assert.deepEqual(failedEvent.payload, {
+          taskId: RuntimeTaskId.make("task-patch-2"),
+          status: "failed",
+          error: "exit code 1",
+        });
+      }
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "runtime.warning"),
+        false,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
     );
   });
 

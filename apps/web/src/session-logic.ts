@@ -632,6 +632,8 @@ export function deriveWorkLogEntries(
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
+    // Task patches feed the task-list card, not the work log.
+    if (activity.kind === "task.updated") continue;
     if (activity.kind === "context-window.updated") continue;
     // Turn summaries render as the status strip above the composer, not here.
     if (activity.kind === "turn.summary") continue;

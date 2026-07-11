@@ -2799,6 +2799,27 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
+      case "task_updated": {
+        // Incremental patch of a tracked task's state; forward only the
+        // wire-safe fields clients merge into their task map.
+        const patch = message.patch;
+        const description = patch.description?.trim();
+        const error = patch.error?.trim();
+        yield* offerRuntimeEvent({
+          ...base,
+          type: "task.updated",
+          payload: {
+            taskId: RuntimeTaskId.make(message.task_id),
+            ...(patch.status ? { status: patch.status } : {}),
+            ...(description ? { description } : {}),
+            ...(error ? { error } : {}),
+            ...(patch.is_backgrounded !== undefined
+              ? { isBackgrounded: patch.is_backgrounded }
+              : {}),
+          },
+        });
+        return;
+      }
       case "files_persisted":
         yield* offerRuntimeEvent({
           ...base,

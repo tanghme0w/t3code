@@ -213,6 +213,7 @@ import { ProviderStatusBanner } from "./chat/ProviderStatusBanner";
 import { ThreadErrorBanner } from "./chat/ThreadErrorBanner";
 import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import { TurnSummaryStrip } from "./chat/TurnSummaryStrip";
+import { TaskSummaryRail, useTaskSummaryRail } from "./chat/TaskSummaryRail";
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   buildExpiredTerminalContextToastCopy,
@@ -1341,6 +1342,7 @@ function ChatViewContent(props: ChatViewProps) {
     return openTerminalThreadKeys.filter((nextThreadKey) => existingThreadKeys.has(nextThreadKey));
   }, [draftThreadKeys, openTerminalThreadKeys, serverThreadKeys]);
   const activeLatestTurn = activeThread?.latestTurn ?? null;
+  const taskSummaryRail = useTaskSummaryRail(activeThread?.activities);
   const sourcePlanThreadRef = useMemo(() => {
     const sourceThreadId = activeLatestTurn?.sourceProposedPlan?.threadId;
     if (!activeThread || !sourceThreadId || sourceThreadId === activeThread.id) {
@@ -5003,8 +5005,11 @@ function ChatViewContent(props: ChatViewProps) {
       rightPanelAvailable={activeProject !== null}
       rightPanelOpen={rightPanelOpen}
       rightPanelShortcutLabel={shortcutLabelForCommand(keybindings, "rightPanel.toggle")}
+      taskSummaryAvailable={taskSummaryRail.available}
+      taskSummaryOpen={taskSummaryRail.open}
       onToggleTerminal={toggleTerminalVisibility}
       onToggleRightPanel={toggleRightPanel}
+      onToggleTaskSummary={taskSummaryRail.toggle}
     />
   );
   const panelLayoutControls = (
@@ -5360,6 +5365,10 @@ function ChatViewContent(props: ChatViewProps) {
             ) : null}
           </div>
           {/* end chat column */}
+
+          {/* Pinned task-summary rail — the conversation column yields width
+              so the rail mirrors the left sidebar (Codex-style three columns) */}
+          {taskSummaryRail.open ? <TaskSummaryRail taskList={taskSummaryRail.taskList} /> : null}
         </div>
         {/* end horizontal flex container */}
 
