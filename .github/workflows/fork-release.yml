@@ -1,0 +1,115 @@
+name: Fork Release
+
+# Lean release pipeline for this fork. The upstream release.yml depends on the
+# upstream org's self-hosted runners and relay/Clerk production config, so it
+# cannot run here; this workflow builds an unsigned macOS arm64 artifact on a
+# GitHub-hosted runner and publishes it as a GitHub Release. Desktop builds
+# embed this repo as their electron-updater feed (GITHUB_REPOSITORY at build
+# time), so installed apps auto-update from these releases.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "!v*-nightly.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (for example 0.0.29 or v0.0.29)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_release:
+    name: Build and publish macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - id: release_meta
+        name: Resolve release version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            raw="${DISPATCH_VERSION}"
+          else
+            raw="${GITHUB_REF_NAME}"
+          fi
+
+          version="${raw#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $raw" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          # Plain X.Y.Z versions become the release the updater's stable
+          # channel follows; suffixed versions publish as prereleases it
+          # ignores (useful for pipeline smoke tests).
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ steps.release_meta.outputs.version }}"
+
+      - name: Build desktop artifact (unsigned)
+        run: |
+          vp run dist:desktop:artifact \
+            --platform mac \
+            --target dmg \
+            --arch arm64 \
+            --build-version "${{ steps.release_meta.outputs.version }}" \
+            --verbose
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          for pattern in \
+            "release/*.dmg" \
+            "release/*.zip" \
+            "release/*.blockmap" \
+            "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+            done
+          done
+          ls -la release-publish
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: T3 Code v${{ steps.release_meta.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ steps.release_meta.outputs.is_prerelease }}
+          make_latest: ${{ steps.release_meta.outputs.make_latest }}
+          files: |
+            release-publish/*.dmg
+            release-publish/*.zip
+            release-publish/*.blockmap
+            release-publish/*.yml
+          fail_on_unmatched_files: true
