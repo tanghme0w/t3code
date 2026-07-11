@@ -110,11 +110,24 @@ const make = Effect.gen(function* () {
     const keptAnchorIds = new Set<string>(orderedTurnIds);
     const keptAnchors = cursor.turnAnchors.filter((anchor) => keptAnchorIds.has(anchor.turnId));
 
-    const isTipFork = event.payload.atTurnId === null;
+    const isTipFork =
+      event.payload.atTurnId === null && (event.payload.atMessageId ?? null) === null;
+
+    // A cut fork that kept no turns must start cold: seeding the source
+    // cursor would resume the FULL source conversation behind an
+    // empty-looking thread.
+    if (!isTipFork && orderedTurnIds.length === 0) {
+      yield* Effect.logInfo("thread fork: cut before the first turn; fork starts cold", {
+        forkThreadId,
+        sourceThreadId,
+      });
+      return;
+    }
+
     const anchorUuid = isTipFork
       ? undefined
       : keptAnchors.find((anchor) => anchor.turnId === lastKeptTurnId)?.uuid;
-    if (!isTipFork && lastKeptTurnId !== undefined && anchorUuid === undefined) {
+    if (!isTipFork && anchorUuid === undefined) {
       yield* Effect.logWarning(
         "thread fork: no provider anchor for the cut turn; forked session resumes from the source tip",
         { forkThreadId, sourceThreadId, lastKeptTurnId },

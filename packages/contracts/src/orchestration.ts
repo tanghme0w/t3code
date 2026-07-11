@@ -538,6 +538,14 @@ const ThreadForkCommand = Schema.Struct({
    * into the new thread. Null forks the whole conversation at its tip.
    */
   atTurnId: Schema.NullOr(TurnId),
+  /**
+   * Exclusive message-level cut point: the source message itself and
+   * everything after it are excluded from the fork. Authoritative over
+   * `atTurnId` for the boundary, and the only reliable cut when the
+   * forked-from user message has no (completed) turn yet — without it such
+   * forks degrade to tip forks and the boundary message leaks into the fork.
+   */
+  atMessageId: Schema.optional(Schema.NullOr(MessageId)),
   title: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
 });
@@ -897,6 +905,12 @@ export const ThreadForkedPayload = Schema.Struct({
   sourceThreadId: ThreadId,
   /** Exclusive cut point in the SOURCE thread; null = fork at tip. */
   atTurnId: Schema.NullOr(TurnId),
+  /**
+   * Exclusive message-level cut point in the SOURCE thread; authoritative
+   * over `atTurnId` for the boundary. Absent/null on events journaled before
+   * this field existed and on tip forks.
+   */
+  atMessageId: Schema.optional(Schema.NullOr(MessageId)),
   createdAt: IsoDateTime,
 });
 

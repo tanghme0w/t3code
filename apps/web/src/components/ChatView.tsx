@@ -4916,9 +4916,11 @@ function ChatViewContent(props: ChatViewProps) {
 
   // [thread-fork] Fork the thread at a user message: the new thread carries
   // the history BEFORE that message (provider session forks server-side) and
-  // the composer is prefilled with the message text for tweaking. User
-  // message rows carry no turnId in projections; the cut turn is the next
-  // assistant message's turn in the timeline (none → fork at tip).
+  // the composer is prefilled with the message text for tweaking. The message
+  // id is the authoritative boundary server-side; the cut turn is this
+  // message's own turn, found on the next assistant message in the timeline
+  // (the scan stops at the next user message so an unanswered boundary
+  // message can never borrow a later turn).
   const onForkFromMessage = useCallback(
     (input: { readonly messageId: MessageId; readonly prefillText: string }) => {
       void (async () => {
@@ -4927,9 +4929,14 @@ function ChatViewContent(props: ChatViewProps) {
         const entryIndex = timelineEntries.findIndex(
           (entry) => entry.kind === "message" && entry.message.id === input.messageId,
         );
-        for (let index = entryIndex; index >= 0 && index < timelineEntries.length; index += 1) {
+        for (
+          let index = entryIndex + 1;
+          entryIndex >= 0 && index < timelineEntries.length;
+          index += 1
+        ) {
           const entry = timelineEntries[index];
           if (!entry || entry.kind !== "message") continue;
+          if (entry.message.role === "user") break;
           if (entry.message.turnId !== null) {
             cutTurnId = entry.message.turnId;
             break;
@@ -4943,6 +4950,7 @@ function ChatViewContent(props: ChatViewProps) {
             threadId: nextThreadId,
             sourceThreadId: activeThread.id,
             atTurnId: cutTurnId,
+            atMessageId: input.messageId,
           },
         });
         if (result._tag === "Failure") {

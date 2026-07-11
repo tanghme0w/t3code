@@ -295,6 +295,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             threadId: command.threadId,
             sourceThreadId: command.sourceThreadId,
             atTurnId: command.atTurnId,
+            atMessageId: command.atMessageId ?? null,
             createdAt: command.createdAt,
           },
         },
