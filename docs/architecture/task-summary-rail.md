@@ -79,7 +79,8 @@ Notes on the wire format:
 - `TodoListCard` — the To-dos card: TodoWrite plan steps with per-step status
   icons, progress bar, `completed/total` counter.
 - `TaskListCard` — the Background-tasks card: status icons, progress bar,
-  `n/m` counter, live mid-task summaries, `bg` badge for backgrounded tasks.
+  `n/m` counter, live mid-task summaries, `bg` badge for backgrounded tasks;
+  rows truncate to one line and click-toggle to full wrapped text.
 - The header's task-summary toggle lives in
   `apps/web/src/components/chat/PanelLayoutControls.tsx` behind optional
   props (`taskSummaryAvailable/taskSummaryOpen/onToggleTaskSummary`); it only

@@ -75,7 +75,7 @@ interface TaskSummaryRailProps {
  */
 export function TaskSummaryRail({ taskList, activePlan }: TaskSummaryRailProps) {
   return (
-    <aside className="min-h-0 w-[19.5rem] shrink-0 space-y-3 overflow-y-auto py-3 pr-3 max-sm:hidden">
+    <aside className="min-h-0 w-[19.5rem] shrink-0 space-y-3 overflow-y-auto p-3 max-sm:hidden">
       <TodoListCard plan={activePlan} />
       <TaskListCard taskList={taskList} />
     </aside>
