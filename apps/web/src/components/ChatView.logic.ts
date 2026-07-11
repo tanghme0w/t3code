@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   isProviderDriverKind,
+  type MessageId,
   ProjectId,
   type ModelSelection,
   type ProviderDriverKind,
@@ -9,7 +10,8 @@ import {
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
-import { type ChatMessage, type SessionPhase, type Thread } from "../types";
+import { type ChatMessage, type SessionPhase, type Thread, type TurnDiffSummary } from "../types";
+import { type TimelineEntry } from "../session-logic";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -359,6 +361,74 @@ export async function waitForServerThreadExists(
     (thread) => thread !== null && thread !== undefined,
     timeoutMs,
   );
+}
+
+// [thread-retry] Everything needed to re-run an assistant response: rewind
+// to the checkpoint just before its user message, then resend that prompt.
+export interface RetryMessageContext {
+  readonly userMessageId: MessageId;
+  readonly text: string;
+  readonly hasAttachments: boolean;
+  readonly targetTurnCount: number;
+}
+
+export interface RewindTargets {
+  readonly revertTurnCountByUserMessageId: Map<MessageId, number>;
+  readonly retryContextByAssistantMessageId: Map<MessageId, RetryMessageContext>;
+}
+
+// A user message's rewind target is the checkpoint state just BEFORE it —
+// i.e. the last checkpoint seen while walking the timeline up to that
+// message. Walking forward with a running count (instead of requiring the
+// message's own turn to have completed a checkpoint) keeps edit/retry
+// available when a turn was interrupted or errored before its checkpoint
+// landed. Threads without any checkpoint coverage (non-git workspaces)
+// expose no targets at all, matching where reverts can actually run.
+export function deriveRewindTargets(input: {
+  readonly timelineEntries: ReadonlyArray<TimelineEntry>;
+  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  readonly inferredCheckpointTurnCountByTurnId: Readonly<Record<string, number | undefined>>;
+  readonly checkpointCount: number;
+}): RewindTargets {
+  const revertTurnCountByUserMessageId = new Map<MessageId, number>();
+  const retryContextByAssistantMessageId = new Map<MessageId, RetryMessageContext>();
+  if (input.checkpointCount === 0) {
+    return { revertTurnCountByUserMessageId, retryContextByAssistantMessageId };
+  }
+
+  let checkpointTurnCountSoFar = 0;
+  let currentUserMessage: { readonly message: ChatMessage; readonly target: number } | null = null;
+  for (const entry of input.timelineEntries) {
+    if (!entry || entry.kind !== "message") {
+      continue;
+    }
+    const message = entry.message;
+    if (message.role === "user") {
+      currentUserMessage = { message, target: checkpointTurnCountSoFar };
+      revertTurnCountByUserMessageId.set(message.id, checkpointTurnCountSoFar);
+      continue;
+    }
+    if (message.role !== "assistant") {
+      continue;
+    }
+    if (currentUserMessage !== null) {
+      retryContextByAssistantMessageId.set(message.id, {
+        userMessageId: currentUserMessage.message.id,
+        text: currentUserMessage.message.text,
+        hasAttachments: (currentUserMessage.message.attachments?.length ?? 0) > 0,
+        targetTurnCount: currentUserMessage.target,
+      });
+    }
+    const summary = input.turnDiffSummaryByAssistantMessageId.get(message.id);
+    const turnCount = summary
+      ? (summary.checkpointTurnCount ?? input.inferredCheckpointTurnCountByTurnId[summary.turnId])
+      : undefined;
+    if (typeof turnCount === "number") {
+      checkpointTurnCountSoFar = Math.max(checkpointTurnCountSoFar, turnCount);
+    }
+  }
+
+  return { revertTurnCountByUserMessageId, retryContextByAssistantMessageId };
 }
 
 export type ThreadRevertWaitOutcome =

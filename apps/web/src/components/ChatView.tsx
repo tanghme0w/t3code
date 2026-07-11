@@ -233,6 +233,7 @@ import {
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
   resolveSendEnvMode,
+  deriveRewindTargets, // [edit-message][thread-retry]
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   waitForServerThreadExists, // [thread-fork]
@@ -269,14 +270,6 @@ interface EditingMessageState {
   readonly stashedPrompt: string;
 }
 
-// [thread-retry] Everything needed to re-run an assistant response: rewind to
-// the checkpoint just before its user message, then resend that prompt.
-interface RetryMessageContext {
-  readonly userMessageId: MessageId;
-  readonly text: string;
-  readonly hasAttachments: boolean;
-  readonly targetTurnCount: number;
-}
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -2149,65 +2142,21 @@ function ChatViewContent(props: ChatViewProps) {
     }
     return byMessageId;
   }, [turnDiffSummaries]);
-  // A user message's rewind target is the checkpoint state just BEFORE it —
-  // i.e. the last checkpoint seen while walking the timeline up to that
-  // message. Walking backward (instead of requiring the message's own turn to
-  // have completed a checkpoint) keeps edit/retry available when the turn was
-  // interrupted or errored before its checkpoint landed. Threads without any
-  // checkpoint coverage (non-git workspaces) expose no targets at all.
-  const { revertTurnCountByUserMessageId, retryContextByAssistantMessageId } = useMemo(() => {
-    const byUserMessageId = new Map<MessageId, number>();
-    const retryByAssistantMessageId = new Map<MessageId, RetryMessageContext>();
-    if ((activeThread?.checkpoints.length ?? 0) === 0) {
-      return {
-        revertTurnCountByUserMessageId: byUserMessageId,
-        retryContextByAssistantMessageId: retryByAssistantMessageId,
-      };
-    }
-
-    let checkpointTurnCountSoFar = 0;
-    let currentUserMessage: { readonly message: ChatMessage; readonly target: number } | null =
-      null;
-    for (const entry of timelineEntries) {
-      if (!entry || entry.kind !== "message") {
-        continue;
-      }
-      const message = entry.message;
-      if (message.role === "user") {
-        currentUserMessage = { message, target: checkpointTurnCountSoFar };
-        byUserMessageId.set(message.id, checkpointTurnCountSoFar);
-        continue;
-      }
-      if (message.role !== "assistant") {
-        continue;
-      }
-      if (currentUserMessage !== null) {
-        retryByAssistantMessageId.set(message.id, {
-          userMessageId: currentUserMessage.message.id,
-          text: currentUserMessage.message.text,
-          hasAttachments: (currentUserMessage.message.attachments?.length ?? 0) > 0,
-          targetTurnCount: currentUserMessage.target,
-        });
-      }
-      const summary = turnDiffSummaryByAssistantMessageId.get(message.id);
-      const turnCount = summary
-        ? (summary.checkpointTurnCount ?? inferredCheckpointTurnCountByTurnId[summary.turnId])
-        : undefined;
-      if (typeof turnCount === "number") {
-        checkpointTurnCountSoFar = Math.max(checkpointTurnCountSoFar, turnCount);
-      }
-    }
-
-    return {
-      revertTurnCountByUserMessageId: byUserMessageId,
-      retryContextByAssistantMessageId: retryByAssistantMessageId,
-    };
-  }, [
-    activeThread?.checkpoints.length,
-    inferredCheckpointTurnCountByTurnId,
-    timelineEntries,
-    turnDiffSummaryByAssistantMessageId,
-  ]);
+  const { revertTurnCountByUserMessageId, retryContextByAssistantMessageId } = useMemo(
+    () =>
+      deriveRewindTargets({
+        timelineEntries,
+        turnDiffSummaryByAssistantMessageId,
+        inferredCheckpointTurnCountByTurnId,
+        checkpointCount: activeThread?.checkpoints.length ?? 0,
+      }),
+    [
+      activeThread?.checkpoints.length,
+      inferredCheckpointTurnCountByTurnId,
+      timelineEntries,
+      turnDiffSummaryByAssistantMessageId,
+    ],
+  );
   const retryStateByAssistantMessageId = useMemo(() => {
     const byMessageId = new Map<MessageId, TimelineRetryState>();
     for (const [messageId, context] of retryContextByAssistantMessageId) {
