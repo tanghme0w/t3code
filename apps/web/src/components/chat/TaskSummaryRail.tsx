@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 import { deriveThreadTaskList, type ThreadTaskList } from "~/lib/taskList";
@@ -30,13 +30,21 @@ export interface TaskSummaryRailState {
 /**
  * Rail state for a thread: derives the task list from activities and holds
  * the pinned flag behind the header's task-summary toggle. Pinned by default;
- * the rail only renders while the thread actually has tasks.
+ * the rail only renders while the thread actually has tasks. When
+ * `rightPanelOpen` flips on, the rail unpins itself so the two side surfaces
+ * do not stack — the user can still re-pin it via the header toggle.
  */
 export function useTaskSummaryRail(
   activities: ReadonlyArray<OrchestrationThreadActivity> | undefined,
+  rightPanelOpen: boolean,
 ): TaskSummaryRailState {
   const taskList = useMemo(() => deriveThreadTaskList(activities ?? []), [activities]);
   const [pinned, setPinned] = useState(true);
+  useEffect(() => {
+    if (rightPanelOpen) {
+      setPinned(false);
+    }
+  }, [rightPanelOpen]);
   const toggle = useCallback(() => setPinned((value) => !value), []);
   const available = taskList.totalCount > 0;
   return {

@@ -30,6 +30,12 @@ interface ChatHeaderProps {
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
   rightPanelOpen: boolean;
+  /**
+   * Whether the titlebar overlay shows a third panel toggle (task summary).
+   * The header actions reserve extra right padding so the overlay never
+   * covers them.
+   */
+  taskSummaryToggleVisible?: boolean;
   gitCwd: string | null;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
@@ -64,6 +70,7 @@ export const ChatHeader = memo(function ChatHeader({
   keybindings,
   availableEditors,
   rightPanelOpen,
+  taskSummaryToggleVisible = false,
   gitCwd,
   onRunProjectScript,
   onAddProjectScript,
@@ -97,7 +104,7 @@ export const ChatHeader = memo(function ChatHeader({
         data-chat-header-actions
         className={cn(
           "flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3",
-          rightPanelOpen ? "pr-0" : "pr-16",
+          rightPanelOpen ? "pr-0" : taskSummaryToggleVisible ? "pr-24" : "pr-16",
         )}
       >
         {activeProjectScripts && (
