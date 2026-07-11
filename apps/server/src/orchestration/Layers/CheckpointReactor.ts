@@ -623,17 +623,28 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    // Prefer the live provider session cwd, but fall back to the thread
+    // worktree / project workspace root like the capture paths do — the
+    // provider session is routinely gone (idle exit, server restart) while
+    // the checkpoint refs in the git workspace remain perfectly revertable.
     const sessionRuntime = yield* resolveSessionRuntimeForThread(event.payload.threadId);
-    if (Option.isNone(sessionRuntime)) {
+    const projects = yield* resolveThreadProjects(thread.projectId);
+    const workspaceCwd =
+      Option.match(sessionRuntime, {
+        onNone: () => undefined,
+        onSome: (runtime) => runtime.cwd,
+      }) ?? resolveThreadWorkspaceCwd({ thread, projects });
+    if (!workspaceCwd) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
-        detail: "No active provider session with workspace cwd is bound to this thread.",
+        detail:
+          "No workspace cwd is bound to this thread: no active provider session, thread worktree, or project workspace root.",
         createdAt: now,
       }).pipe(Effect.catch(() => Effect.void));
       return;
     }
-    if (!isGitWorkspace(sessionRuntime.value.cwd)) {
+    if (!isGitWorkspace(workspaceCwd)) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
@@ -676,7 +687,7 @@ const make = Effect.gen(function* () {
     }
 
     const restored = yield* checkpointStore.restoreCheckpoint({
-      cwd: sessionRuntime.value.cwd,
+      cwd: workspaceCwd,
       checkpointRef: targetCheckpointRef,
       fallbackToHead: event.payload.turnCount === 0,
     });
@@ -692,14 +703,54 @@ const make = Effect.gen(function* () {
 
     // Refresh the workspace entry index so the @-mention file picker
     // reflects the reverted filesystem state.
-    yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
+    yield* workspaceEntries.refresh(workspaceCwd);
 
+    // The provider conversation rollback recovers a stopped session from its
+    // persisted resume cursor when needed. Failure here must not abort the
+    // revert: the filesystem is already restored, so completing the revert
+    // (truncating messages/checkpoints) keeps the thread consistent — a stale
+    // provider memory is the lesser inconsistency, and it is surfaced below.
     const rolledBackTurns = Math.max(0, currentTurnCount - event.payload.turnCount);
     if (rolledBackTurns > 0) {
-      yield* providerService.rollbackConversation({
-        threadId: sessionRuntime.value.threadId,
-        numTurns: rolledBackTurns,
-      });
+      yield* providerService
+        .rollbackConversation({
+          threadId: event.payload.threadId,
+          numTurns: rolledBackTurns,
+        })
+        .pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("checkpoint revert: provider conversation rollback failed", {
+              threadId: event.payload.threadId,
+              turnCount: event.payload.turnCount,
+              rolledBackTurns,
+              detail: error.message,
+            }),
+          ),
+          Effect.catch((error) =>
+            Effect.gen(function* () {
+              const commandId = yield* serverCommandId("checkpoint-revert-provider-rollback");
+              const activityId = yield* serverEventId;
+              yield* orchestrationEngine.dispatch({
+                type: "thread.activity.append",
+                commandId,
+                threadId: event.payload.threadId,
+                activity: {
+                  id: activityId,
+                  tone: "error",
+                  kind: "checkpoint.revert.provider-rollback-failed",
+                  summary: "Provider conversation rollback failed",
+                  payload: {
+                    turnCount: event.payload.turnCount,
+                    detail: error.message,
+                  },
+                  turnId: null,
+                  createdAt: now,
+                },
+                createdAt: now,
+              });
+            }).pipe(Effect.catch(() => Effect.void)),
+          ),
+        );
     }
 
     const staleCheckpointRefs: Array<CheckpointRef> = [];
@@ -711,7 +762,7 @@ const make = Effect.gen(function* () {
 
     if (staleCheckpointRefs.length > 0) {
       yield* checkpointStore.deleteCheckpointRefs({
-        cwd: sessionRuntime.value.cwd,
+        cwd: workspaceCwd,
         checkpointRefs: staleCheckpointRefs,
       });
     }
