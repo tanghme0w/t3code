@@ -807,6 +807,48 @@ describe("ProviderRuntimeIngestion", () => {
     expect(rawOutput?.content).toBe('import * as Effect from "effect/Effect"\n');
   });
 
+  it("maps turn.summary events into persisted turn.summary activities", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "turn.summary",
+      eventId: asEventId("evt-turn-summary"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-summary-1"),
+      payload: {
+        statusDetail: "Waiting on permission: Bash",
+        statusCategory: "blocked",
+        needsAction: "Approve or deny Bash",
+        summarizesUuid: "assistant-uuid-1",
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-turn-summary",
+      ),
+    );
+    const activity = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-turn-summary",
+    );
+    const payload =
+      activity?.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(activity?.kind).toBe("turn.summary");
+    expect(activity?.tone).toBe("info");
+    expect(activity?.summary).toBe("Waiting on permission: Bash");
+    expect(payload?.statusDetail).toBe("Waiting on permission: Bash");
+    expect(payload?.statusCategory).toBe("blocked");
+    expect(payload?.needsAction).toBe("Approve or deny Bash");
+    expect(payload?.summarizesUuid).toBe("assistant-uuid-1");
+    expect(payload?.live).toBeUndefined();
+  });
+
   it("normalizes command execution activities to ran-command summaries", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

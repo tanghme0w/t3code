@@ -1708,6 +1708,69 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("maps classifier summary subtypes into turn.summary events", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_summary",
+        detail: "Running the test suite",
+        session_id: "sdk-session-turn-summary",
+        uuid: "task-summary-1",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "post_turn_summary",
+        summarizes_uuid: "assistant-uuid-1",
+        status_category: "blocked",
+        status_detail: "Waiting on permission: Bash",
+        needs_action: "Approve or deny Bash",
+        session_id: "sdk-session-turn-summary",
+        uuid: "post-turn-summary-1",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const summaryEvents = runtimeEvents.filter((event) => event.type === "turn.summary");
+      assert.equal(summaryEvents.length, 2);
+      const [liveEvent, finalEvent] = summaryEvents;
+      if (liveEvent?.type === "turn.summary") {
+        assert.deepEqual(liveEvent.payload, {
+          statusDetail: "Running the test suite",
+          live: true,
+        });
+      }
+      if (finalEvent?.type === "turn.summary") {
+        assert.deepEqual(finalEvent.payload, {
+          statusDetail: "Waiting on permission: Bash",
+          statusCategory: "blocked",
+          needsAction: "Approve or deny Bash",
+          summarizesUuid: "assistant-uuid-1",
+        });
+      }
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "runtime.warning"),
+        false,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("emits thread token usage updates from Claude task progress", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

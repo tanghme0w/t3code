@@ -166,6 +166,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "turn.proposed.delta",
   "turn.proposed.completed",
   "turn.diff.updated",
+  "turn.summary",
   "item.started",
   "item.updated",
   "item.completed",
@@ -216,6 +217,7 @@ const TurnPlanUpdatedType = Schema.Literal("turn.plan.updated");
 const TurnProposedDeltaType = Schema.Literal("turn.proposed.delta");
 const TurnProposedCompletedType = Schema.Literal("turn.proposed.completed");
 const TurnDiffUpdatedType = Schema.Literal("turn.diff.updated");
+const TurnSummaryType = Schema.Literal("turn.summary");
 const ItemStartedType = Schema.Literal("item.started");
 const ItemUpdatedType = Schema.Literal("item.updated");
 const ItemCompletedType = Schema.Literal("item.completed");
@@ -400,6 +402,18 @@ const TurnDiffUpdatedPayload = Schema.Struct({
   unifiedDiff: Schema.String,
 });
 export type TurnDiffUpdatedPayload = typeof TurnDiffUpdatedPayload.Type;
+
+// One-line turn status from the provider's background classifier. Claude emits
+// `post_turn_summary` after each turn (live=false) and debounced `task_summary`
+// progress phrases mid-turn (live=true). Metadata only — never model context.
+const TurnSummaryPayload = Schema.Struct({
+  statusDetail: TrimmedNonEmptyStringSchema,
+  statusCategory: Schema.optional(TrimmedNonEmptyStringSchema),
+  needsAction: Schema.optional(TrimmedNonEmptyStringSchema),
+  summarizesUuid: Schema.optional(TrimmedNonEmptyStringSchema),
+  live: Schema.optional(Schema.Boolean),
+});
+export type TurnSummaryPayload = typeof TurnSummaryPayload.Type;
 
 export const ItemLifecyclePayload = Schema.Struct({
   itemType: CanonicalItemType,
@@ -763,6 +777,13 @@ const ProviderRuntimeTurnDiffUpdatedEvent = Schema.Struct({
 });
 export type ProviderRuntimeTurnDiffUpdatedEvent = typeof ProviderRuntimeTurnDiffUpdatedEvent.Type;
 
+const ProviderRuntimeTurnSummaryEvent = Schema.Struct({
+  ...ProviderRuntimeEventBase.fields,
+  type: TurnSummaryType,
+  payload: TurnSummaryPayload,
+});
+export type ProviderRuntimeTurnSummaryEvent = typeof ProviderRuntimeTurnSummaryEvent.Type;
+
 const ProviderRuntimeItemStartedEvent = Schema.Struct({
   ...ProviderRuntimeEventBase.fields,
   type: ItemStartedType,
@@ -985,6 +1006,7 @@ export const ProviderRuntimeEventV2 = Schema.Union([
   ProviderRuntimeTurnProposedDeltaEvent,
   ProviderRuntimeTurnProposedCompletedEvent,
   ProviderRuntimeTurnDiffUpdatedEvent,
+  ProviderRuntimeTurnSummaryEvent,
   ProviderRuntimeItemStartedEvent,
   ProviderRuntimeItemUpdatedEvent,
   ProviderRuntimeItemCompletedEvent,

@@ -2628,6 +2628,45 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       },
     };
 
+    // Newer CLI subtypes missing from the pinned SDK's type union, so match on
+    // a widened string before the exhaustive switch. Both carry one-line turn
+    // status text from the CLI's background classifier: `post_turn_summary`
+    // lands once after each turn; `task_summary` is the debounced mid-turn
+    // progress phrase (detail is null on the idle clear — nothing to emit).
+    const wideSubtype: string = message.subtype;
+    if (wideSubtype === "post_turn_summary" || wideSubtype === "task_summary") {
+      const record = message as unknown as Record<string, unknown>;
+      const statusDetail = (
+        typeof record.status_detail === "string"
+          ? record.status_detail
+          : typeof record.detail === "string"
+            ? record.detail
+            : ""
+      ).trim();
+      if (statusDetail.length === 0) {
+        return;
+      }
+      const optionalText = (value: unknown): string | undefined => {
+        const trimmed = typeof value === "string" ? value.trim() : "";
+        return trimmed.length > 0 ? trimmed : undefined;
+      };
+      const statusCategory = optionalText(record.status_category);
+      const needsAction = optionalText(record.needs_action);
+      const summarizesUuid = optionalText(record.summarizes_uuid);
+      yield* offerRuntimeEvent({
+        ...base,
+        type: "turn.summary",
+        payload: {
+          statusDetail,
+          ...(statusCategory ? { statusCategory } : {}),
+          ...(needsAction ? { needsAction } : {}),
+          ...(summarizesUuid ? { summarizesUuid } : {}),
+          ...(wideSubtype === "task_summary" ? { live: true } : {}),
+        },
+      });
+      return;
+    }
+
     switch (message.subtype) {
       case "init":
         yield* offerRuntimeEvent({

@@ -384,6 +384,33 @@ function runtimeEventToActivities(
       ];
     }
 
+    case "turn.summary": {
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: "info",
+          kind: "turn.summary",
+          summary: truncateDetail(event.payload.statusDetail, 120),
+          payload: {
+            statusDetail: truncateDetail(event.payload.statusDetail),
+            ...(event.payload.statusCategory
+              ? { statusCategory: event.payload.statusCategory }
+              : {}),
+            ...(event.payload.needsAction
+              ? { needsAction: truncateDetail(event.payload.needsAction) }
+              : {}),
+            ...(event.payload.summarizesUuid
+              ? { summarizesUuid: event.payload.summarizesUuid }
+              : {}),
+            ...(event.payload.live ? { live: true } : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
     case "turn.plan.updated": {
       return [
         {
