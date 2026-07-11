@@ -361,6 +361,99 @@ export async function waitForServerThreadExists(
   );
 }
 
+export type ThreadRevertWaitOutcome =
+  | { readonly outcome: "reverted" }
+  | { readonly outcome: "failed"; readonly detail: string }
+  | { readonly outcome: "timeout" };
+
+// [edit-message] Deferred-discard edits and retries dispatch the checkpoint
+// revert only at send time, so the follow-up turn must wait until the revert
+// has actually applied — otherwise the freshly sent message races the
+// truncation (and the provider rollback). The revert has no dedicated client
+// receipt; its two observable outcomes on the thread detail atom are:
+// - success: `thread.reverted` projects and the discarded message disappears;
+// - failure: the server appends a `checkpoint.revert.failed` activity.
+export async function waitForThreadRevertOutcome(
+  threadRef: ScopedThreadRef,
+  input: {
+    readonly discardedMessageId: string;
+    readonly timeoutMs?: number;
+  },
+): Promise<ThreadRevertWaitOutcome> {
+  const timeoutMs = input.timeoutMs ?? 15_000;
+  const threadAtom = environmentThreadDetails.detailAtom(threadRef);
+  const getThread = () => appAtomRegistry.get(threadAtom);
+
+  const preexistingFailureIds = new Set(
+    (getThread()?.activities ?? [])
+      .filter((activity) => activity.kind === "checkpoint.revert.failed")
+      .map((activity) => activity.id),
+  );
+
+  const resolveOutcome = (thread: Thread | null | undefined): ThreadRevertWaitOutcome | null => {
+    if (!thread) {
+      return null;
+    }
+    const failure = thread.activities.find(
+      (activity) =>
+        activity.kind === "checkpoint.revert.failed" && !preexistingFailureIds.has(activity.id),
+    );
+    if (failure) {
+      const payload = failure.payload;
+      const detail =
+        typeof payload === "object" &&
+        payload !== null &&
+        "detail" in payload &&
+        typeof (payload as { detail?: unknown }).detail === "string"
+          ? (payload as { detail: string }).detail
+          : failure.summary;
+      return { outcome: "failed", detail };
+    }
+    if (!thread.messages.some((message) => message.id === input.discardedMessageId)) {
+      return { outcome: "reverted" };
+    }
+    return null;
+  };
+
+  const immediate = resolveOutcome(getThread());
+  if (immediate) {
+    return immediate;
+  }
+
+  return await new Promise<ThreadRevertWaitOutcome>((resolve) => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const finish = (result: ThreadRevertWaitOutcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+      unsubscribe();
+      resolve(result);
+    };
+
+    const unsubscribe = appAtomRegistry.subscribe(threadAtom, (thread) => {
+      const result = resolveOutcome(thread);
+      if (result) {
+        finish(result);
+      }
+    });
+
+    const afterSubscribe = resolveOutcome(getThread());
+    if (afterSubscribe) {
+      finish(afterSubscribe);
+      return;
+    }
+
+    timeoutId = globalThis.setTimeout(() => {
+      finish({ outcome: "timeout" });
+    }, timeoutMs);
+  });
+}
+
 async function waitForServerThreadCondition(
   threadRef: ScopedThreadRef,
   predicate: (thread: Thread | null | undefined) => boolean,

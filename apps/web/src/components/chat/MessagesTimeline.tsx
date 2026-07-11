@@ -54,9 +54,9 @@ import {
   PaintbrushIcon,
   PencilIcon, // [thread-fork]
   MinusIcon,
+  RotateCcwIcon,
   SquarePenIcon,
   TerminalIcon,
-  Undo2Icon,
   WrenchIcon,
   XIcon,
   ZapIcon,
@@ -81,6 +81,7 @@ import {
   type MessagesTimelineRow,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
+  type TimelineRetryState,
 } from "./MessagesTimeline.logic";
 import { TerminalContextInlineChip } from "./TerminalContextInlineChip";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -131,7 +132,8 @@ interface TimelineRowSharedState {
   workspaceRoot: string | undefined;
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
-  onRevertUserMessage: (messageId: MessageId) => void;
+  // [thread-retry] Re-run the turn that produced this assistant message.
+  onRetryFromMessage: (assistantMessageId: MessageId) => void;
   // [thread-fork]
   onForkFromMessage: (input: {
     readonly messageId: MessageId;
@@ -152,6 +154,10 @@ interface TimelineRowActivityState {
   isWorking: boolean;
   isRevertingCheckpoint: boolean;
   activeTurnInProgress: boolean;
+  // [edit-message] createdAt of the message being edited; rows from this
+  // point on are visually dimmed — they will be replaced when the edited
+  // message is sent.
+  editingFromCreatedAt: string | null;
 }
 
 const TimelineRowCtx = createContext<TimelineRowSharedState>(null!);
@@ -176,7 +182,9 @@ interface MessagesTimelineProps {
   routeThreadKey: string;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
-  onRevertUserMessage: (messageId: MessageId) => void;
+  // [thread-retry]
+  retryStateByAssistantMessageId: Map<MessageId, TimelineRetryState>;
+  onRetryFromMessage: (assistantMessageId: MessageId) => void;
   // [thread-fork]
   onForkFromMessage: (input: {
     readonly messageId: MessageId;
@@ -188,6 +196,8 @@ interface MessagesTimelineProps {
     readonly prefillText: string;
   }) => void;
   isRevertingCheckpoint: boolean;
+  // [edit-message]
+  editingFromCreatedAt: string | null;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
   markdownCwd: string | undefined;
@@ -219,10 +229,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   routeThreadKey,
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
-  onRevertUserMessage,
+  retryStateByAssistantMessageId, // [thread-retry]
+  onRetryFromMessage, // [thread-retry]
   onForkFromMessage, // [thread-fork]
   onEditUserMessage, // [thread-fork]
   isRevertingCheckpoint,
+  editingFromCreatedAt, // [edit-message]
   onImageExpand,
   activeThreadEnvironmentId,
   markdownCwd,
@@ -327,6 +339,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         activeTurnStartedAt,
         turnDiffSummaryByAssistantMessageId,
         revertTurnCountByUserMessageId,
+        retryStateByAssistantMessageId,
       }),
     [
       timelineEntries,
@@ -338,6 +351,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       activeTurnStartedAt,
       turnDiffSummaryByAssistantMessageId,
       revertTurnCountByUserMessageId,
+      retryStateByAssistantMessageId,
     ],
   );
   const rows = useStableRows(rawRows);
@@ -440,7 +454,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       workspaceRoot,
       skills,
       activeThreadEnvironmentId,
-      onRevertUserMessage,
+      onRetryFromMessage, // [thread-retry]
       onForkFromMessage, // [thread-fork]
       onEditUserMessage, // [thread-fork]
       onImageExpand,
@@ -456,7 +470,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       workspaceRoot,
       skills,
       activeThreadEnvironmentId,
-      onRevertUserMessage,
+      onRetryFromMessage, // [thread-retry]
       onForkFromMessage, // [thread-fork]
       onEditUserMessage, // [thread-fork]
       onImageExpand,
@@ -470,8 +484,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       isWorking,
       isRevertingCheckpoint,
       activeTurnInProgress,
+      editingFromCreatedAt, // [edit-message]
     }),
-    [activeTurnInProgress, isRevertingCheckpoint, isWorking],
+    [activeTurnInProgress, editingFromCreatedAt, isRevertingCheckpoint, isWorking],
   );
 
   // Stable renderItem — no closure deps. Row components read shared state
@@ -823,6 +838,14 @@ type TimelineWorkEntry = Extract<MessagesTimelineRow, { kind: "work" }>["grouped
 type TimelineRow = MessagesTimelineRow;
 
 const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: TimelineRow }) {
+  const activity = use(TimelineRowActivityCtx);
+  // [edit-message] While an edit is pending, everything from the edited
+  // message onward is about to be replaced — dim it so the boundary is
+  // visible without any blocking dialog.
+  const dimmedForEdit =
+    activity.editingFromCreatedAt !== null &&
+    row.createdAt !== null &&
+    row.createdAt >= activity.editingFromCreatedAt;
   return (
     <div
       className={cn(
@@ -834,9 +857,11 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
           ? "pb-2"
           : "pb-4",
         row.kind === "message" && row.message.role === "assistant" ? "group/assistant" : null,
+        dimmedForEdit ? "opacity-40 transition-opacity duration-200" : null,
       )}
       data-timeline-row-id={row.id}
       data-timeline-row-kind={row.kind}
+      data-timeline-row-dimmed-for-edit={dimmedForEdit ? "true" : undefined}
       data-message-id={row.kind === "message" ? row.message.id : undefined}
       data-message-role={row.kind === "message" ? row.message.role : undefined}
     >
@@ -957,7 +982,6 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                 prefillText={displayedUserMessage.copyText ?? ""}
               />
             )}
-            {canRevertAgentWork && <RevertUserMessageButton messageId={row.message.id} />}
             {displayedUserMessage.copyText && (
               <MessageCopyButton text={displayedUserMessage.copyText} variant="ghost" />
             )}
@@ -1001,8 +1025,9 @@ function ForkFromMessageButton({
   );
 }
 
-// [thread-fork] Edit & resend: prefill the composer with this message and
-// revert the thread to just before it.
+// [thread-fork][edit-message] Edit: prefill the composer with this message
+// and enter edit mode. Nothing is discarded yet — the rewind happens only
+// when the edited message is actually sent (cancel restores everything).
 function EditUserMessageButton({
   messageId,
   prefillText,
@@ -1023,20 +1048,30 @@ function EditUserMessageButton({
             variant="ghost"
             disabled={activity.isRevertingCheckpoint || activity.isWorking}
             onClick={() => ctx.onEditUserMessage({ messageId, prefillText })}
-            aria-label="Edit and resend"
+            aria-label="Edit message"
           />
         }
       >
         <PencilIcon className="size-3" />
       </TooltipTrigger>
-      <TooltipPopup side="top">Edit &amp; resend</TooltipPopup>
+      <TooltipPopup side="top">Edit — rewinds to here on send</TooltipPopup>
     </Tooltip>
   );
 }
 
-function RevertUserMessageButton({ messageId }: { messageId: MessageId }) {
+// [thread-retry] Re-run the turn that produced this assistant response: the
+// thread rewinds to just before its user message and the same prompt is sent
+// again. Available on every settled response, including interrupted ones.
+function RetryFromMessageButton({
+  messageId,
+  retryState,
+}: {
+  messageId: MessageId;
+  retryState: TimelineRetryState;
+}) {
   const ctx = use(TimelineRowCtx);
   const activity = use(TimelineRowActivityCtx);
+  const blocked = retryState === "attachments-blocked";
 
   return (
     <Tooltip>
@@ -1044,17 +1079,27 @@ function RevertUserMessageButton({ messageId }: { messageId: MessageId }) {
         render={
           <Button
             type="button"
-            size="xs"
+            size="icon-xs"
             variant="ghost"
-            disabled={activity.isRevertingCheckpoint || activity.isWorking}
-            onClick={() => ctx.onRevertUserMessage(messageId)}
-            aria-label="Revert to this message"
+            className="text-muted-foreground"
+            disabled={
+              blocked ||
+              activity.isRevertingCheckpoint ||
+              activity.isWorking ||
+              activity.activeTurnInProgress
+            }
+            onClick={() => ctx.onRetryFromMessage(messageId)}
+            aria-label="Retry from here"
           />
         }
       >
-        <Undo2Icon className="size-3" />
+        <RotateCcwIcon className="size-3" />
       </TooltipTrigger>
-      <TooltipPopup side="top">Revert to this message</TooltipPopup>
+      <TooltipPopup side="top">
+        {blocked
+          ? "Retry is unavailable for messages with attachments"
+          : "Retry — rewinds and re-runs this response"}
+      </TooltipPopup>
     </Tooltip>
   );
 }
@@ -1102,6 +1147,10 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         {row.showAssistantMeta ? (
           <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
             <AssistantCopyButton row={row} />
+            {/* [thread-retry] */}
+            {row.retryState !== undefined && (
+              <RetryFromMessageButton messageId={row.message.id} retryState={row.retryState} />
+            )}
             {!row.message.streaming && (
               <Tooltip>
                 <TooltipTrigger

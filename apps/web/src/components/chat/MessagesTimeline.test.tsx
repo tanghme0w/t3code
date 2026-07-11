@@ -178,10 +178,12 @@ function buildProps() {
     routeThreadKey: "environment-local:thread-1",
     onOpenTurnDiff: () => {},
     revertTurnCountByUserMessageId: new Map(),
-    onRevertUserMessage: () => {},
+    retryStateByAssistantMessageId: new Map(), // [thread-retry]
+    onRetryFromMessage: () => {}, // [thread-retry]
     onForkFromMessage: () => {}, // [thread-fork]
     onEditUserMessage: () => {}, // [thread-fork]
     isRevertingCheckpoint: false,
+    editingFromCreatedAt: null, // [edit-message]
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
     markdownCwd: undefined,
