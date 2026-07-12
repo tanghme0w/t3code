@@ -4,6 +4,7 @@ import { EventId, type OrchestrationThreadActivity, TurnId } from "@t3tools/cont
 import { deriveThreadTaskList } from "./taskList";
 
 let counter = 0;
+const BASE_TIME_MS = Date.parse("2026-03-23T00:00:00.000Z");
 function makeActivity(kind: string, payload: unknown): OrchestrationThreadActivity {
   counter += 1;
   return {
@@ -13,7 +14,7 @@ function makeActivity(kind: string, payload: unknown): OrchestrationThreadActivi
     summary: kind,
     payload,
     turnId: TurnId.make("turn-1"),
-    createdAt: "2026-03-23T00:00:00.000Z",
+    createdAt: new Date(BASE_TIME_MS + counter * 1000).toISOString(),
   };
 }
 
@@ -80,5 +81,111 @@ describe("taskList", () => {
     ]);
 
     expect(list.totalCount).toBe(0);
+  });
+
+  it("classifies tasks into agent/process/workflow kinds", () => {
+    const list = deriveThreadTaskList([
+      makeActivity("task.started", {
+        taskId: "agent-1",
+        taskType: "local_agent",
+        subagentType: "Explore",
+        detail: "Map the pipeline",
+        prompt: "Find every consumer of task activities",
+      }),
+      makeActivity("task.started", {
+        taskId: "agent-2",
+        taskType: "remote_agent",
+        detail: "Cloud review",
+      }),
+      makeActivity("task.started", {
+        taskId: "bash-1",
+        taskType: "local_bash",
+        detail: "pnpm install",
+      }),
+      makeActivity("task.started", {
+        taskId: "wf-1",
+        taskType: "local_workflow",
+        workflowName: "spec",
+        detail: "Run spec workflow",
+      }),
+      makeActivity("task.started", { taskId: "bare-1", detail: "Legacy activity" }),
+    ]);
+
+    const byId = new Map(list.tasks.map((task) => [task.taskId, task]));
+    expect(byId.get("agent-1")?.kind).toBe("agent");
+    expect(byId.get("agent-1")?.subagentType).toBe("Explore");
+    expect(byId.get("agent-1")?.prompt).toBe("Find every consumer of task activities");
+    expect(byId.get("agent-2")?.kind).toBe("agent");
+    expect(byId.get("bash-1")?.kind).toBe("process");
+    expect(byId.get("wf-1")?.kind).toBe("workflow");
+    expect(byId.get("wf-1")?.workflowName).toBe("spec");
+    expect(byId.get("bare-1")?.kind).toBe("task");
+  });
+
+  it("parses usage stats and keeps the latest defined values", () => {
+    const list = deriveThreadTaskList([
+      makeActivity("task.started", { taskId: "task-1", detail: "Agent run" }),
+      makeActivity("task.progress", {
+        taskId: "task-1",
+        summary: "Reading files",
+        lastToolName: "Read",
+        usage: { total_tokens: 1200, tool_uses: 3, duration_ms: 4000 },
+      }),
+      makeActivity("task.progress", {
+        taskId: "task-1",
+        summary: "Editing files",
+        lastToolName: "Edit",
+        usage: "not-a-record",
+      }),
+      makeActivity("task.completed", {
+        taskId: "task-1",
+        status: "completed",
+        usage: { total_tokens: 5400, tool_uses: 9, duration_ms: 61000 },
+      }),
+    ]);
+
+    const task = list.tasks[0];
+    expect(task?.usage).toEqual({ totalTokens: 5400, toolUses: 9, durationMs: 61000 });
+    expect(task?.lastToolName).toBe("Edit");
+  });
+
+  it("accumulates a bounded progress history and dedupes consecutive summaries", () => {
+    const activities = [
+      makeActivity("task.started", { taskId: "task-1", detail: "Long agent run" }),
+      makeActivity("task.progress", { taskId: "task-1", summary: "Step one" }),
+      makeActivity("task.progress", { taskId: "task-1", summary: "Step one" }),
+      makeActivity("task.progress", { taskId: "task-1" }),
+      makeActivity("task.progress", { taskId: "task-1", summary: "Step two" }),
+    ];
+    const list = deriveThreadTaskList(activities);
+    expect(list.tasks[0]?.progress.map((entry) => entry.summary)).toEqual(["Step one", "Step two"]);
+    expect(list.tasks[0]?.summary).toBe("Step two");
+
+    const many = [makeActivity("task.started", { taskId: "task-2", detail: "Chatty run" })];
+    for (let index = 0; index < 35; index += 1) {
+      many.push(makeActivity("task.progress", { taskId: "task-2", summary: `Update ${index}` }));
+    }
+    const capped = deriveThreadTaskList(many);
+    expect(capped.tasks[0]?.progress).toHaveLength(30);
+    expect(capped.tasks[0]?.progress[0]?.summary).toBe("Update 5");
+    expect(capped.tasks[0]?.progress.at(-1)?.summary).toBe("Update 34");
+  });
+
+  it("tracks startedAt and settledAt from activity timestamps", () => {
+    const started = makeActivity("task.started", { taskId: "task-1", detail: "Agent run" });
+    const progress = makeActivity("task.progress", { taskId: "task-1", summary: "Working" });
+    const completed = makeActivity("task.completed", { taskId: "task-1", status: "completed" });
+    const list = deriveThreadTaskList([started, progress, completed]);
+
+    expect(list.tasks[0]?.startedAt).toBe(started.createdAt);
+    expect(list.tasks[0]?.settledAt).toBe(completed.createdAt);
+
+    const killed = makeActivity("task.updated", { taskId: "task-2", status: "killed" });
+    const killedList = deriveThreadTaskList([
+      makeActivity("task.started", { taskId: "task-2", detail: "Doomed run" }),
+      killed,
+    ]);
+    expect(killedList.tasks[0]?.settledAt).toBe(killed.createdAt);
+    expect(killedList.settledCount).toBe(1);
   });
 });

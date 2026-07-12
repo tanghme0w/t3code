@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 import { deriveThreadTaskList, type ThreadTaskList } from "~/lib/taskList";
+import type { ActivePlanState } from "~/session-logic";
 import { TaskListCard } from "./TaskListCard";
+import { TodoListCard } from "./TodoListCard";
 
 /**
  * Pinned summary rail beside the conversation column (Codex-style three-column
@@ -17,8 +19,10 @@ import { TaskListCard } from "./TaskListCard";
  */
 
 export interface TaskSummaryRailState {
-  /** Derived task list for the rail's cards. */
+  /** Derived background-task list for the rail's cards. */
   readonly taskList: ThreadTaskList;
+  /** Latest TodoWrite plan for the rail's todo card (null when none). */
+  readonly activePlan: ActivePlanState | null;
   /** Whether the thread has anything to summarize (controls the header toggle). */
   readonly available: boolean;
   /** Whether the rail should currently be rendered. */
@@ -28,15 +32,17 @@ export interface TaskSummaryRailState {
 }
 
 /**
- * Rail state for a thread: derives the task list from activities and holds
- * the pinned flag behind the header's task-summary toggle. Pinned by default;
- * the rail only renders while the thread actually has tasks. When
- * `rightPanelOpen` flips on, the rail unpins itself so the two side surfaces
- * do not stack — the user can still re-pin it via the header toggle.
+ * Rail state for a thread: derives the background-task list from activities,
+ * carries the thread's latest TodoWrite plan, and holds the pinned flag behind
+ * the header's task-summary toggle. Pinned by default; the rail only renders
+ * while the thread actually has todos or tasks. When `rightPanelOpen` flips
+ * on, the rail unpins itself so the two side surfaces do not stack — the user
+ * can still re-pin it via the header toggle.
  */
 export function useTaskSummaryRail(
   activities: ReadonlyArray<OrchestrationThreadActivity> | undefined,
   rightPanelOpen: boolean,
+  activePlan: ActivePlanState | null,
 ): TaskSummaryRailState {
   const taskList = useMemo(() => deriveThreadTaskList(activities ?? []), [activities]);
   const [pinned, setPinned] = useState(true);
@@ -46,9 +52,10 @@ export function useTaskSummaryRail(
     }
   }, [rightPanelOpen]);
   const toggle = useCallback(() => setPinned((value) => !value), []);
-  const available = taskList.totalCount > 0;
+  const available = taskList.totalCount > 0 || (activePlan?.steps.length ?? 0) > 0;
   return {
     taskList,
+    activePlan,
     available,
     open: pinned && available,
     toggle,
@@ -57,16 +64,19 @@ export function useTaskSummaryRail(
 
 interface TaskSummaryRailProps {
   readonly taskList: ThreadTaskList;
+  readonly activePlan: ActivePlanState | null;
 }
 
 /**
- * The rail column itself. New summary cards (outputs, sources, …) extend this
- * by rendering as siblings of <TaskListCard> — each card derives its own data
- * from thread activities and hides itself when it has nothing to show.
+ * The rail column itself: the todo card (TodoWrite plan steps) first, then the
+ * background-task card. New summary cards (outputs, sources, …) extend this by
+ * rendering as further siblings — each card derives its own data from thread
+ * activities and hides itself when it has nothing to show.
  */
-export function TaskSummaryRail({ taskList }: TaskSummaryRailProps) {
+export function TaskSummaryRail({ taskList, activePlan }: TaskSummaryRailProps) {
   return (
-    <aside className="min-h-0 w-[19.5rem] shrink-0 overflow-y-auto py-3 pr-3 max-sm:hidden">
+    <aside className="min-h-0 w-[19.5rem] shrink-0 space-y-3 overflow-y-auto p-3 max-sm:hidden">
+      <TodoListCard plan={activePlan} />
       <TaskListCard taskList={taskList} />
     </aside>
   );

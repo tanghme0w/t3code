@@ -1342,7 +1342,6 @@ function ChatViewContent(props: ChatViewProps) {
     return openTerminalThreadKeys.filter((nextThreadKey) => existingThreadKeys.has(nextThreadKey));
   }, [draftThreadKeys, openTerminalThreadKeys, serverThreadKeys]);
   const activeLatestTurn = activeThread?.latestTurn ?? null;
-  const taskSummaryRail = useTaskSummaryRail(activeThread?.activities, rightPanelOpen);
   const sourcePlanThreadRef = useMemo(() => {
     const sourceThreadId = activeLatestTurn?.sourceProposedPlan?.threadId;
     if (!activeThread || !sourceThreadId || sourceThreadId === activeThread.id) {
@@ -1796,6 +1795,7 @@ function ChatViewContent(props: ChatViewProps) {
     () => deriveActivePlanState(threadActivities, activeLatestTurn?.turnId ?? undefined),
     [activeLatestTurn?.turnId, threadActivities],
   );
+  const taskSummaryRail = useTaskSummaryRail(activeThread?.activities, rightPanelOpen, activePlan);
   const planSidebarLabel = sidebarProposedPlan || interactionMode === "plan" ? "Plan" : "Tasks";
   const showPlanFollowUpPrompt =
     pendingUserInputs.length === 0 &&
@@ -5369,7 +5369,12 @@ function ChatViewContent(props: ChatViewProps) {
 
           {/* Pinned task-summary rail — the conversation column yields width
               so the rail mirrors the left sidebar (Codex-style three columns) */}
-          {taskSummaryRail.open ? <TaskSummaryRail taskList={taskSummaryRail.taskList} /> : null}
+          {taskSummaryRail.open ? (
+            <TaskSummaryRail
+              taskList={taskSummaryRail.taskList}
+              activePlan={taskSummaryRail.activePlan}
+            />
+          ) : null}
         </div>
         {/* end horizontal flex container */}
 

@@ -1777,6 +1777,72 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("forwards subagent identity fields on task_started", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-agent-1",
+        description: "Map the event pipeline",
+        task_type: "local_agent",
+        subagent_type: "Explore",
+        prompt: "  Trace task activities from adapter to rail.  ",
+        session_id: "sdk-session-task-started",
+        uuid: "task-started-1",
+      } as unknown as SDKMessage);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-workflow-1",
+        description: "Run spec workflow",
+        task_type: "local_workflow",
+        workflow_name: "spec",
+        session_id: "sdk-session-task-started",
+        uuid: "task-started-2",
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const startedEvents = runtimeEvents.filter((event) => event.type === "task.started");
+      assert.equal(startedEvents.length, 2);
+      const [agentEvent, workflowEvent] = startedEvents;
+      if (agentEvent?.type === "task.started") {
+        assert.deepEqual(agentEvent.payload, {
+          taskId: RuntimeTaskId.make("task-agent-1"),
+          description: "Map the event pipeline",
+          taskType: "local_agent",
+          subagentType: "Explore",
+          prompt: "Trace task activities from adapter to rail.",
+        });
+      }
+      if (workflowEvent?.type === "task.started") {
+        assert.deepEqual(workflowEvent.payload, {
+          taskId: RuntimeTaskId.make("task-workflow-1"),
+          description: "Run spec workflow",
+          taskType: "local_workflow",
+          workflowName: "spec",
+        });
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("maps classifier summary subtypes into turn.summary events", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
