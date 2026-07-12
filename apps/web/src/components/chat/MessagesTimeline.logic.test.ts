@@ -1,10 +1,15 @@
+import { CheckpointRef, MessageId, TurnId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import { deriveTimelineEntries } from "../../session-logic";
+import type { ChatMessage, TurnDiffSummary } from "../../types";
+import { deriveRewindTargets } from "../ChatView.logic";
 import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
   deriveMessagesTimelineRows,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
+  type TimelineRetryState,
 } from "./MessagesTimeline.logic";
 
 describe("computeMessageDurationStart", () => {
@@ -1169,5 +1174,108 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+});
+
+describe("retry affordance across the timeline derivation pipeline", () => {
+  function userMessage(id: string, createdAt: string): ChatMessage {
+    return {
+      id: MessageId.make(id),
+      role: "user",
+      text: `prompt ${id}`,
+      turnId: null,
+      streaming: false,
+      createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
+  function assistantMessage(id: string, turnId: string, createdAt: string): ChatMessage {
+    return {
+      id: MessageId.make(id),
+      role: "assistant",
+      text: `answer ${id}`,
+      turnId: TurnId.make(turnId),
+      streaming: false,
+      createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
+  function summary(turnId: string, count: number, assistantId: string): TurnDiffSummary {
+    return {
+      turnId: TurnId.make(turnId),
+      checkpointTurnCount: count,
+      checkpointRef: CheckpointRef.make(`refs/t3/checkpoints/x/turn/${count}`),
+      status: "ready",
+      files: [],
+      assistantMessageId: MessageId.make(assistantId),
+      completedAt: `2026-07-12T0${count}:30:00.000Z`,
+    };
+  }
+
+  it("exposes retry on every settled response — completed turns included, not just interrupted ones", () => {
+    // Thread shape: three completed checkpointed exchanges followed by an
+    // interrupted partial whose own checkpoint never landed.
+    const messages: ChatMessage[] = [
+      userMessage("u1", "2026-07-12T01:00:00.000Z"),
+      assistantMessage("a1", "turn-1", "2026-07-12T01:10:00.000Z"),
+      userMessage("u2", "2026-07-12T02:00:00.000Z"),
+      assistantMessage("a2", "turn-2", "2026-07-12T02:10:00.000Z"),
+      userMessage("u3", "2026-07-12T03:00:00.000Z"),
+      assistantMessage("a3", "turn-3", "2026-07-12T03:10:00.000Z"),
+      userMessage("u4", "2026-07-12T04:00:00.000Z"),
+      assistantMessage("a4", "turn-4", "2026-07-12T04:10:00.000Z"),
+    ];
+    const turnDiffSummaryByAssistantMessageId = new Map<MessageId, TurnDiffSummary>([
+      [MessageId.make("a1"), summary("turn-1", 1, "a1")],
+      [MessageId.make("a2"), summary("turn-2", 2, "a2")],
+      [MessageId.make("a3"), summary("turn-3", 3, "a3")],
+    ]);
+
+    const timelineEntries = deriveTimelineEntries(messages, [], []);
+    const targets = deriveRewindTargets({
+      timelineEntries,
+      turnDiffSummaryByAssistantMessageId,
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 3,
+    });
+    const retryStateByAssistantMessageId = new Map<MessageId, TimelineRetryState>(
+      [...targets.retryContextByAssistantMessageId].map(([messageId, context]) => [
+        messageId,
+        context.hasAttachments ? ("attachments-blocked" as const) : ("ready" as const),
+      ]),
+    );
+
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestTurn: {
+        turnId: TurnId.make("turn-4"),
+        state: "interrupted",
+        startedAt: "2026-07-12T04:05:00.000Z",
+        completedAt: "2026-07-12T04:15:00.000Z",
+      },
+      runningTurnId: null,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId,
+      revertTurnCountByUserMessageId: targets.revertTurnCountByUserMessageId,
+      retryStateByAssistantMessageId,
+    });
+
+    const assistantRows = rows.flatMap((row) =>
+      row.kind === "message" && row.message.role === "assistant" ? [row] : [],
+    );
+    expect(assistantRows.map((row) => row.message.id)).toEqual(["a1", "a2", "a3", "a4"]);
+    for (const row of assistantRows) {
+      expect(row.showAssistantMeta).toBe(true);
+      expect(row.retryState).toBe("ready");
+    }
+
+    // Rewind targets: each user message rewinds to the checkpoint before it.
+    expect(targets.revertTurnCountByUserMessageId.get(MessageId.make("u1"))).toBe(0);
+    expect(targets.revertTurnCountByUserMessageId.get(MessageId.make("u2"))).toBe(1);
+    expect(targets.revertTurnCountByUserMessageId.get(MessageId.make("u3"))).toBe(2);
+    expect(targets.revertTurnCountByUserMessageId.get(MessageId.make("u4"))).toBe(3);
   });
 });
