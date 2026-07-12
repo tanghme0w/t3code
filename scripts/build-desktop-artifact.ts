@@ -1693,10 +1693,19 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   // electron-builder is filtering out stageResourcesDir directory in the AppImage for production
   yield* fs.copy(stageResourcesDir, path.join(stageAppDir, "apps/desktop/prod-resources"));
 
+  // Passkey signing (Clerk Associated Domains) is opt-in: it only runs when a
+  // provisioning profile is configured. A plain Developer ID sign + notarize
+  // needs just the signing cert (CSC_LINK) and a notarization API key, so a
+  // signed build without a profile skips the passkey entitlements and rides
+  // electron-builder's default hardened-runtime entitlements — enough for a
+  // notarizable, auto-updating app.
+  const macSigningEnv =
+    options.platform === "mac" && options.signed ? loadRepoEnv({ repoRoot }) : undefined;
   const configuredMacPasskeySigning =
-    options.platform === "mac" && options.signed
+    macSigningEnv !== undefined &&
+    (macSigningEnv.T3CODE_MACOS_PROVISIONING_PROFILE?.trim() ?? "").length > 0
       ? yield* Effect.try({
-          try: () => resolveMacPasskeySigningConfiguration(loadRepoEnv({ repoRoot })),
+          try: () => resolveMacPasskeySigningConfiguration(macSigningEnv),
           catch: MacPasskeySigningConfigurationResolutionError.fromCause,
         })
       : undefined;
