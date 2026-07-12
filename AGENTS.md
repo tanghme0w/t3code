@@ -12,6 +12,20 @@ T3 Code is a minimal web GUI for using coding agents like Codex and Claude.
 
 This repository is a VERY EARLY WIP. Proposing sweeping changes that improve long-term maintainability is encouraged.
 
+## Fork Boundary
+
+This repository is a personal fork of upstream t3code (`pingdotgg/t3code`), maintained as a
+self-use modification. Treat the fork as the entire world:
+
+- No public distribution of builds or source for now.
+- Never open pull requests against the upstream repository and never push to upstream remotes.
+  All merges, commits, pushes, and CI workflows happen inside this fork (`tanghme0w/t3code`).
+- Before starting a new feature, sync the fork with the latest upstream t3code first.
+- Write features decoupled from upstream core code: prefer fork-only files/modules and keep
+  diffs in shared upstream files minimal, so upstream merges stay low-friction (see the
+  "Upstream-merge posture" section of `docs/architecture/task-summary-rail.md` for the
+  reference pattern).
+
 ## Core Priorities
 
 1. Performance first.
