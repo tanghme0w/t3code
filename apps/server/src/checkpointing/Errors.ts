@@ -6,8 +6,15 @@ import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 export const CheckpointDiffOperation = Schema.Literals([
   "CheckpointDiffQuery.getTurnDiff",
   "CheckpointDiffQuery.getFullThreadDiff",
+  "CheckpointDiffQuery.previewRevertDiff",
 ]);
 export type CheckpointDiffOperation = typeof CheckpointDiffOperation.Type;
+
+const CHECKPOINT_DIFF_RESULT_LABEL: Record<CheckpointDiffOperation, string> = {
+  "CheckpointDiffQuery.getTurnDiff": "turn diff",
+  "CheckpointDiffQuery.getFullThreadDiff": "full thread diff",
+  "CheckpointDiffQuery.previewRevertDiff": "revert preview diff",
+};
 
 /** The computed result does not satisfy the checkpoint RPC contract. */
 export class CheckpointDiffResultInvalidError extends Schema.TaggedErrorClass<CheckpointDiffResultInvalidError>()(
@@ -18,8 +25,7 @@ export class CheckpointDiffResultInvalidError extends Schema.TaggedErrorClass<Ch
   },
 ) {
   override get message(): string {
-    const result =
-      this.operation === "CheckpointDiffQuery.getTurnDiff" ? "turn diff" : "full thread diff";
+    const result = CHECKPOINT_DIFF_RESULT_LABEL[this.operation];
     return `Checkpoint invariant violation in ${this.operation}: Computed ${result} result does not satisfy contract schema.`;
   }
 }
@@ -46,8 +52,7 @@ export class CheckpointWorkspacePathMissingError extends Schema.TaggedErrorClass
   },
 ) {
   override get message(): string {
-    const diff =
-      this.operation === "CheckpointDiffQuery.getTurnDiff" ? "turn diff" : "full thread diff";
+    const diff = CHECKPOINT_DIFF_RESULT_LABEL[this.operation];
     return `Checkpoint invariant violation in ${this.operation}: Workspace path missing for thread '${this.threadId}' when computing ${diff}.`;
   }
 }

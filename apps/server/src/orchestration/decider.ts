@@ -615,6 +615,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           turnCount: command.turnCount,
+          revertMode: command.revertMode ?? "workspace-and-conversation",
           createdAt: command.createdAt,
         },
       };

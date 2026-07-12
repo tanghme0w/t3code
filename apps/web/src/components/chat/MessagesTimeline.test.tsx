@@ -182,6 +182,7 @@ function buildProps() {
     onRetryFromMessage: () => {}, // [thread-retry]
     onForkFromMessage: () => {}, // [thread-fork]
     onEditUserMessage: () => {}, // [thread-fork]
+    onRewindUserMessage: () => {}, // [thread-rewind]
     isRevertingCheckpoint: false,
     editingFromCreatedAt: null, // [edit-message]
     onImageExpand: () => {},

@@ -645,3 +645,71 @@ export function hasServerAcknowledgedLocalDispatch(input: {
     input.localDispatch.sessionUpdatedAt !== (session?.updatedAt ?? null)
   );
 }
+
+// ---------------------------------------------------------------------------
+// [thread-rewind] Revert preview helpers
+// ---------------------------------------------------------------------------
+
+export interface UnifiedDiffFileSummary {
+  readonly path: string;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+export interface UnifiedDiffSummary {
+  readonly files: ReadonlyArray<UnifiedDiffFileSummary>;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+const DIFF_GIT_HEADER = /^diff --git a\/(.+?) b\/(.+)$/;
+
+/**
+ * Compact per-file summary of a unified diff patch for the rewind preview
+ * dialog. Counts added/removed lines per `diff --git` section, ignoring the
+ * `+++`/`---` file headers. Rename sections report the new path.
+ */
+export function summarizeUnifiedDiff(patch: string): UnifiedDiffSummary {
+  const files: Array<{ path: string; additions: number; deletions: number }> = [];
+  let current: { path: string; additions: number; deletions: number } | null = null;
+  for (const line of patch.split("\n")) {
+    const header = DIFF_GIT_HEADER.exec(line);
+    if (header) {
+      if (current) {
+        files.push(current);
+      }
+      current = { path: header[2] ?? header[1] ?? "unknown", additions: 0, deletions: 0 };
+      continue;
+    }
+    if (!current || line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      current.additions += 1;
+    } else if (line.startsWith("-")) {
+      current.deletions += 1;
+    }
+  }
+  if (current) {
+    files.push(current);
+  }
+  return {
+    files,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+  };
+}
+
+/**
+ * How many thread messages a rewind anchored at `fromCreatedAt` discards —
+ * the same boundary rule the timeline uses to dim rows during an edit.
+ */
+export function countDiscardedMessages(
+  messages: ReadonlyArray<{ readonly createdAt: string }>,
+  fromCreatedAt: string,
+): number {
+  return messages.reduce(
+    (count, message) => (message.createdAt >= fromCreatedAt ? count + 1 : count),
+    0,
+  );
+}

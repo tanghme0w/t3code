@@ -9,6 +9,16 @@ export function checkpointRefForThreadTurn(threadId: ThreadId, turnCount: number
   );
 }
 
+/**
+ * Ephemeral ref used to snapshot the current workspace state for revert
+ * previews. Callers must delete the ref once the diff is computed.
+ */
+export function checkpointPreviewRefForThread(threadId: ThreadId, nonce: string): CheckpointRef {
+  return CheckpointRef.make(
+    `${CHECKPOINT_REFS_PREFIX}/${Encoding.encodeBase64Url(threadId)}/preview/${nonce}`,
+  );
+}
+
 export function resolveThreadWorkspaceCwd(input: {
   readonly thread: {
     readonly projectId: ProjectId;

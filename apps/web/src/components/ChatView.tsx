@@ -1,5 +1,6 @@
 import {
   type ApprovalRequestId,
+  type CheckpointRevertMode,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -203,6 +204,7 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { RevertPreviewDialog } from "./chat/RevertPreviewDialog"; // [thread-rewind]
 import { type TimelineRetryState } from "./chat/MessagesTimeline.logic";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
@@ -229,6 +231,7 @@ import {
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerImageForRetry,
+  countDiscardedMessages, // [thread-rewind]
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
@@ -240,6 +243,7 @@ import {
   waitForStartedServerThread,
   waitForThreadRevertOutcome, // [edit-message]
 } from "./ChatView.logic";
+import { useRevertPreviewDiff } from "../state/queries"; // [thread-rewind]
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
@@ -268,6 +272,17 @@ interface EditingMessageState {
   readonly messageCreatedAt: string;
   readonly targetTurnCount: number;
   readonly stashedPrompt: string;
+}
+
+// [thread-rewind] A pending destructive-rewind confirmation: either the
+// standalone rewind button ("rewind") or an edit being sent ("edit-send").
+// The dialog previews the workspace diff and picks the revert mode.
+interface RevertDialogState {
+  readonly variant: "rewind" | "edit-send";
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+  readonly messageCreatedAt: string;
+  readonly targetTurnCount: number;
 }
 
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
@@ -1133,6 +1148,10 @@ function ChatViewContent(props: ChatViewProps) {
   const [editingMessage, setEditingMessage] = useState<EditingMessageState | null>(null);
   const editingMessageRef = useRef(editingMessage);
   editingMessageRef.current = editingMessage;
+  // [thread-rewind] Pending rewind confirmation dialog plus the edit-send
+  // decision, carried by ref so the re-entrant onSend call consumes it once.
+  const [revertDialog, setRevertDialog] = useState<RevertDialogState | null>(null);
+  const editSendDecisionRef = useRef<CheckpointRevertMode | null>(null);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -1284,6 +1303,7 @@ function ChatViewContent(props: ChatViewProps) {
     if (!editing) {
       return;
     }
+    editSendDecisionRef.current = null; // [thread-rewind]
     setEditingMessage(null);
     if (editing.threadId !== activeThreadIdRef.current) {
       return;
@@ -3885,6 +3905,9 @@ function ChatViewContent(props: ChatViewProps) {
       readonly threadId: ThreadId;
       readonly targetTurnCount: number;
       readonly discardedMessageId: MessageId;
+      // [thread-rewind] Defaults to rolling workspace files back with the
+      // conversation; "conversation-only" keeps the files as they are.
+      readonly revertMode?: CheckpointRevertMode;
     }): Promise<boolean> => {
       if (activeEnvironmentUnavailable && activeEnvironmentUnavailableLabel) {
         setThreadError(
@@ -3906,6 +3929,7 @@ function ChatViewContent(props: ChatViewProps) {
           input: {
             threadId: input.threadId,
             turnCount: input.targetTurnCount,
+            revertMode: input.revertMode ?? "workspace-and-conversation",
           },
         });
         if (result._tag === "Failure") {
@@ -3959,6 +3983,23 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     if (activePendingProgress) {
       onAdvanceActivePendingUserInput();
+      return;
+    }
+    // [thread-rewind] Sending an edit decides workspace handling first: open
+    // the preview dialog and re-enter onSend once a mode has been chosen.
+    const editingForGate = editingMessageRef.current;
+    if (
+      editingForGate &&
+      editingForGate.threadId === activeThread.id &&
+      editSendDecisionRef.current === null
+    ) {
+      setRevertDialog({
+        variant: "edit-send",
+        threadId: editingForGate.threadId,
+        messageId: editingForGate.messageId,
+        messageCreatedAt: editingForGate.messageCreatedAt,
+        targetTurnCount: editingForGate.targetTurnCount,
+      });
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
@@ -4062,10 +4103,14 @@ function ChatViewContent(props: ChatViewProps) {
     // is lost.
     const editingForSend = editingMessageRef.current;
     if (editingForSend && editingForSend.threadId === threadIdForSend) {
+      // [thread-rewind] Consume the mode chosen in the send dialog exactly once.
+      const editRevertMode = editSendDecisionRef.current ?? "workspace-and-conversation";
+      editSendDecisionRef.current = null;
       const reverted = await performDeferredRevert({
         threadId: editingForSend.threadId,
         targetTurnCount: editingForSend.targetTurnCount,
         discardedMessageId: editingForSend.messageId,
+        revertMode: editRevertMode,
       });
       if (!reverted) {
         sendInFlightRef.current = false;
@@ -5100,13 +5145,80 @@ function ChatViewContent(props: ChatViewProps) {
 
   // [edit-message] Edit mode is scoped to the thread it started on; leaving
   // that thread abandons it (the prefilled text stays behind as a plain
-  // draft — safe, since nothing has been discarded).
+  // draft — safe, since nothing has been discarded). The rewind dialog and
+  // any undecided edit-send mode are dropped with it.
   useEffect(() => {
     const editing = editingMessageRef.current;
     if (editing && editing.threadId !== activeThreadId) {
       setEditingMessage(null);
     }
+    editSendDecisionRef.current = null; // [thread-rewind]
+    setRevertDialog((current) => (current && current.threadId !== activeThreadId ? null : current));
   }, [activeThreadId]);
+
+  // [thread-rewind] Standalone rewind entry: open the preview dialog anchored
+  // at this user message. Nothing is discarded until the dialog confirms.
+  const onRewindUserMessage = useCallback((input: { readonly messageId: MessageId }) => {
+    const threadId = activeThreadIdRef.current;
+    const targetTurnCount = revertTurnCountRef.current.get(input.messageId);
+    if (!threadId || typeof targetTurnCount !== "number") {
+      return;
+    }
+    const entry = timelineEntriesRef.current.find(
+      (candidate) => candidate.kind === "message" && candidate.message.id === input.messageId,
+    );
+    const messageCreatedAt =
+      entry?.kind === "message" ? entry.message.createdAt : new Date().toISOString();
+    setRevertDialog({
+      variant: "rewind",
+      threadId,
+      messageId: input.messageId,
+      messageCreatedAt,
+      targetTurnCount,
+    });
+  }, []);
+
+  // [thread-rewind] Diff the pending dialog's rewind would discard.
+  const revertPreview = useRevertPreviewDiff({
+    environmentId: revertDialog ? environmentId : null,
+    threadId: revertDialog?.threadId ?? null,
+    turnCount: revertDialog?.targetTurnCount ?? null,
+  });
+
+  // [thread-rewind] Dialog outcomes. Edit-send confirms stash the chosen mode
+  // and re-enter onSend, which consumes it exactly once; standalone rewinds
+  // revert immediately without resending anything.
+  const onRevertDialogCancel = () => {
+    editSendDecisionRef.current = null;
+    setRevertDialog(null);
+  };
+  const onRevertDialogConfirm = (mode: CheckpointRevertMode) => {
+    const dialog = revertDialog;
+    if (!dialog) {
+      return;
+    }
+    setRevertDialog(null);
+    if (dialog.variant === "edit-send") {
+      editSendDecisionRef.current = mode;
+      void onSend();
+      return;
+    }
+    void (async () => {
+      if (sendInFlightRef.current) {
+        return;
+      }
+      // A pending edit is superseded by rewinding — restore its stash first.
+      if (editingMessageRef.current) {
+        onCancelEditMessage();
+      }
+      await performDeferredRevert({
+        threadId: dialog.threadId,
+        targetTurnCount: dialog.targetTurnCount,
+        discardedMessageId: dialog.messageId,
+        revertMode: mode,
+      });
+    })();
+  };
 
   // [thread-retry] Re-run the turn behind an assistant response: rewind to
   // the checkpoint just before its user message, then resend that prompt
@@ -5398,6 +5510,7 @@ function ChatViewContent(props: ChatViewProps) {
                 onRetryFromMessage={onRetryFromMessage} // [thread-retry]
                 onForkFromMessage={onForkFromMessage} // [thread-fork]
                 onEditUserMessage={onEditUserMessage} // [thread-fork]
+                onRewindUserMessage={onRewindUserMessage} // [thread-rewind]
                 isRevertingCheckpoint={isRevertingCheckpoint}
                 editingFromCreatedAt={
                   editingMessage && editingMessage.threadId === activeThread.id
@@ -5417,6 +5530,23 @@ function ChatViewContent(props: ChatViewProps) {
                 onIsAtEndChange={onIsAtEndChange}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
               />
+
+              {/* [thread-rewind] Destructive-rewind confirmation with diff preview */}
+              {revertDialog && revertDialog.threadId === activeThread.id ? (
+                <RevertPreviewDialog
+                  variant={revertDialog.variant}
+                  discardedMessageCount={countDiscardedMessages(
+                    activeThread.messages,
+                    revertDialog.messageCreatedAt,
+                  )}
+                  previewPending={revertPreview.isPending}
+                  previewError={revertPreview.error}
+                  previewDiff={revertPreview.data?.diff ?? null}
+                  confirmBusy={isRevertingCheckpoint || isSendBusy}
+                  onConfirm={onRevertDialogConfirm}
+                  onCancel={onRevertDialogCancel}
+                />
+              ) : null}
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
               {showScrollToBottom && (

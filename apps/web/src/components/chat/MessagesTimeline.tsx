@@ -57,6 +57,7 @@ import {
   RotateCcwIcon,
   SquarePenIcon,
   TerminalIcon,
+  Undo2Icon, // [thread-rewind]
   WrenchIcon,
   XIcon,
   ZapIcon,
@@ -144,6 +145,8 @@ interface TimelineRowSharedState {
     readonly messageId: MessageId;
     readonly prefillText: string;
   }) => void;
+  // [thread-rewind] Discard from this message on without resending.
+  onRewindUserMessage: (input: { readonly messageId: MessageId }) => void;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -195,6 +198,8 @@ interface MessagesTimelineProps {
     readonly messageId: MessageId;
     readonly prefillText: string;
   }) => void;
+  // [thread-rewind]
+  onRewindUserMessage: (input: { readonly messageId: MessageId }) => void;
   isRevertingCheckpoint: boolean;
   // [edit-message]
   editingFromCreatedAt: string | null;
@@ -233,6 +238,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onRetryFromMessage, // [thread-retry]
   onForkFromMessage, // [thread-fork]
   onEditUserMessage, // [thread-fork]
+  onRewindUserMessage, // [thread-rewind]
   isRevertingCheckpoint,
   editingFromCreatedAt, // [edit-message]
   onImageExpand,
@@ -457,6 +463,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRetryFromMessage, // [thread-retry]
       onForkFromMessage, // [thread-fork]
       onEditUserMessage, // [thread-fork]
+      onRewindUserMessage, // [thread-rewind]
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -473,6 +480,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onRetryFromMessage, // [thread-retry]
       onForkFromMessage, // [thread-fork]
       onEditUserMessage, // [thread-fork]
+      onRewindUserMessage, // [thread-rewind]
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -977,10 +985,13 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
               prefillText={displayedUserMessage.copyText ?? ""}
             />
             {canRevertAgentWork && (
-              <EditUserMessageButton
-                messageId={row.message.id}
-                prefillText={displayedUserMessage.copyText ?? ""}
-              />
+              <>
+                <RewindUserMessageButton messageId={row.message.id} />
+                <EditUserMessageButton
+                  messageId={row.message.id}
+                  prefillText={displayedUserMessage.copyText ?? ""}
+                />
+              </>
             )}
             {displayedUserMessage.copyText && (
               <MessageCopyButton text={displayedUserMessage.copyText} variant="ghost" />
@@ -1055,6 +1066,35 @@ function EditUserMessageButton({
         <PencilIcon className="size-3" />
       </TooltipTrigger>
       <TooltipPopup side="top">Edit — rewinds to here on send</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+// [thread-rewind] Standalone rewind: discard this message and everything
+// after it WITHOUT resending anything. Opens a confirmation dialog that
+// previews the workspace diff and offers code+conversation or
+// conversation-only rollback.
+function RewindUserMessageButton({ messageId }: { messageId: MessageId }) {
+  const ctx = use(TimelineRowCtx);
+  const activity = use(TimelineRowActivityCtx);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            disabled={activity.isRevertingCheckpoint || activity.isWorking}
+            onClick={() => ctx.onRewindUserMessage({ messageId })}
+            aria-label="Rewind to before this message"
+          />
+        }
+      >
+        <Undo2Icon className="size-3" />
+      </TooltipTrigger>
+      <TooltipPopup side="top">Rewind to here — previews what gets discarded</TooltipPopup>
     </Tooltip>
   );
 }

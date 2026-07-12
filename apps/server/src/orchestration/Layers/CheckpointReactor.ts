@@ -611,6 +611,8 @@ const make = Effect.gen(function* () {
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
   ) {
     const now = DateTime.formatIso(yield* DateTime.now);
+    const revertMode = event.payload.revertMode ?? "workspace-and-conversation";
+    const restoreWorkspace = revertMode === "workspace-and-conversation";
 
     const thread = yield* resolveThreadDetail(event.payload.threadId);
     if (!thread) {
@@ -634,25 +636,31 @@ const make = Effect.gen(function* () {
         onNone: () => undefined,
         onSome: (runtime) => runtime.cwd,
       }) ?? resolveThreadWorkspaceCwd({ thread, projects });
-    if (!workspaceCwd) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail:
-          "No workspace cwd is bound to this thread: no active provider session, thread worktree, or project workspace root.",
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
+    const workspaceIsGit = workspaceCwd !== undefined && isGitWorkspace(workspaceCwd);
+    // Conversation-only reverts perform no filesystem restore, so a missing or
+    // non-git workspace only skips checkpoint ref cleanup instead of failing.
+    if (restoreWorkspace) {
+      if (!workspaceCwd) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail:
+            "No workspace cwd is bound to this thread: no active provider session, thread worktree, or project workspace root.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+      if (!workspaceIsGit) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: "Checkpoints are unavailable because this project is not a git repository.",
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
     }
-    if (!isGitWorkspace(workspaceCwd)) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: "Checkpoints are unavailable because this project is not a git repository.",
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
-    }
+    const checkpointRefsCwd = workspaceIsGit ? workspaceCwd : undefined;
 
     const currentTurnCount = thread.checkpoints.reduce(
       (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
@@ -669,41 +677,43 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const targetCheckpointRef =
-      event.payload.turnCount === 0
-        ? checkpointRefForThreadTurn(event.payload.threadId, 0)
-        : thread.checkpoints.find(
-            (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
-          )?.checkpointRef;
+    if (restoreWorkspace && workspaceCwd) {
+      const targetCheckpointRef =
+        event.payload.turnCount === 0
+          ? checkpointRefForThreadTurn(event.payload.threadId, 0)
+          : thread.checkpoints.find(
+              (checkpoint) => checkpoint.checkpointTurnCount === event.payload.turnCount,
+            )?.checkpointRef;
 
-    if (!targetCheckpointRef) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: `Checkpoint ref for turn ${event.payload.turnCount} is unavailable in read model.`,
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
+      if (!targetCheckpointRef) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: `Checkpoint ref for turn ${event.payload.turnCount} is unavailable in read model.`,
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+
+      const restored = yield* checkpointStore.restoreCheckpoint({
+        cwd: workspaceCwd,
+        checkpointRef: targetCheckpointRef,
+        fallbackToHead: event.payload.turnCount === 0,
+      });
+      if (!restored) {
+        yield* appendRevertFailureActivity({
+          threadId: event.payload.threadId,
+          turnCount: event.payload.turnCount,
+          detail: `Filesystem checkpoint is unavailable for turn ${event.payload.turnCount}.`,
+          createdAt: now,
+        }).pipe(Effect.catch(() => Effect.void));
+        return;
+      }
+
+      // Refresh the workspace entry index so the @-mention file picker
+      // reflects the reverted filesystem state.
+      yield* workspaceEntries.refresh(workspaceCwd);
     }
-
-    const restored = yield* checkpointStore.restoreCheckpoint({
-      cwd: workspaceCwd,
-      checkpointRef: targetCheckpointRef,
-      fallbackToHead: event.payload.turnCount === 0,
-    });
-    if (!restored) {
-      yield* appendRevertFailureActivity({
-        threadId: event.payload.threadId,
-        turnCount: event.payload.turnCount,
-        detail: `Filesystem checkpoint is unavailable for turn ${event.payload.turnCount}.`,
-        createdAt: now,
-      }).pipe(Effect.catch(() => Effect.void));
-      return;
-    }
-
-    // Refresh the workspace entry index so the @-mention file picker
-    // reflects the reverted filesystem state.
-    yield* workspaceEntries.refresh(workspaceCwd);
 
     // The provider conversation rollback recovers a stopped session from its
     // persisted resume cursor when needed. Failure here must not abort the
@@ -760,9 +770,9 @@ const make = Effect.gen(function* () {
       }
     }
 
-    if (staleCheckpointRefs.length > 0) {
+    if (staleCheckpointRefs.length > 0 && checkpointRefsCwd) {
       yield* checkpointStore.deleteCheckpointRefs({
-        cwd: workspaceCwd,
+        cwd: checkpointRefsCwd,
         checkpointRefs: staleCheckpointRefs,
       });
     }

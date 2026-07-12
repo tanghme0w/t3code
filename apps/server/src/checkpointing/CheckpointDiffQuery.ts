@@ -13,8 +13,12 @@ import {
   type OrchestrationGetFullThreadDiffResult,
   type OrchestrationGetTurnDiffInput,
   type OrchestrationGetTurnDiffResult as OrchestrationGetTurnDiffResultType,
+  type OrchestrationPreviewRevertDiffInput,
+  type OrchestrationPreviewRevertDiffResult,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as NodeCrypto from "node:crypto";
+
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -30,7 +34,7 @@ import {
   CheckpointWorkspacePathMissingError,
 } from "./Errors.ts";
 import type { CheckpointServiceError } from "./Errors.ts";
-import { checkpointRefForThreadTurn } from "./Utils.ts";
+import { checkpointPreviewRefForThread, checkpointRefForThreadTurn } from "./Utils.ts";
 import * as CheckpointStore from "./CheckpointStore.ts";
 
 /** Service tag for checkpoint diff queries. */
@@ -54,6 +58,15 @@ export class CheckpointDiffQuery extends Context.Service<
     readonly getFullThreadDiff: (
       input: OrchestrationGetFullThreadDiffInput,
     ) => Effect.Effect<OrchestrationGetFullThreadDiffResult, CheckpointServiceError>;
+
+    /**
+     * Compute the patch a revert to `turnCount` would discard: the checkpoint
+     * snapshot diffed against the current workspace state, captured as an
+     * ephemeral snapshot so uncommitted and untracked files are included.
+     */
+    readonly previewRevertDiff: (
+      input: OrchestrationPreviewRevertDiffInput,
+    ) => Effect.Effect<OrchestrationPreviewRevertDiffResult, CheckpointServiceError>;
   }
 >()("t3/checkpointing/CheckpointDiffQuery") {}
 
@@ -282,9 +295,119 @@ export const make = Effect.gen(function* () {
     return turnDiff satisfies OrchestrationGetFullThreadDiffResult;
   });
 
+  const previewRevertDiff: CheckpointDiffQuery["Service"]["previewRevertDiff"] = Effect.fn(
+    "CheckpointDiffQuery.previewRevertDiff",
+  )(function* (input) {
+    const operation = "CheckpointDiffQuery.previewRevertDiff";
+    const ignoreWhitespace = input.ignoreWhitespace ?? true;
+    yield* Effect.annotateCurrentSpan({
+      "checkpoint.thread_id": input.threadId,
+      "checkpoint.revert_turn_count": input.turnCount,
+      "checkpoint.ignore_whitespace": ignoreWhitespace,
+      "checkpoint.diff_kind": "revert-preview",
+    });
+
+    const threadContext = yield* projectionSnapshotQuery
+      .getThreadCheckpointContext(input.threadId)
+      .pipe(Effect.withSpan("checkpoint.revertPreview.lookupContext"));
+    if (Option.isNone(threadContext)) {
+      return yield* new CheckpointThreadNotFoundError({
+        operation,
+        threadId: input.threadId,
+      });
+    }
+
+    const maxTurnCount = threadContext.value.checkpoints.reduce(
+      (max, checkpoint) => Math.max(max, checkpoint.checkpointTurnCount),
+      0,
+    );
+    if (input.turnCount > maxTurnCount) {
+      return yield* new CheckpointTurnRangeUnavailableError({
+        operation,
+        threadId: input.threadId,
+        requestedTurnCount: input.turnCount,
+        availableTurnCount: maxTurnCount,
+      });
+    }
+
+    const workspaceCwd = threadContext.value.worktreePath ?? threadContext.value.workspaceRoot;
+    if (!workspaceCwd) {
+      return yield* new CheckpointWorkspacePathMissingError({
+        operation,
+        threadId: input.threadId,
+      });
+    }
+
+    const fromCheckpointRef =
+      input.turnCount === 0
+        ? checkpointRefForThreadTurn(input.threadId, 0)
+        : threadContext.value.checkpoints.find(
+            (checkpoint) => checkpoint.checkpointTurnCount === input.turnCount,
+          )?.checkpointRef;
+    if (!fromCheckpointRef) {
+      return yield* new CheckpointRefUnavailableError({
+        operation,
+        threadId: input.threadId,
+        turnCount: input.turnCount,
+        checkpoint: "from",
+      });
+    }
+
+    const previewCheckpointRef = checkpointPreviewRefForThread(
+      input.threadId,
+      NodeCrypto.randomUUID(),
+    );
+
+    const diff = yield* checkpointStore
+      .captureCheckpoint({
+        cwd: workspaceCwd,
+        checkpointRef: previewCheckpointRef,
+      })
+      .pipe(
+        Effect.andThen(
+          checkpointStore.diffCheckpoints({
+            cwd: workspaceCwd,
+            fromCheckpointRef,
+            toCheckpointRef: previewCheckpointRef,
+            // Mirror restoreCheckpoint: a turn-0 revert without a baseline ref
+            // falls back to restoring HEAD, so preview against HEAD too.
+            fallbackFromToHead: input.turnCount === 0,
+            ignoreWhitespace,
+          }),
+        ),
+        Effect.ensuring(
+          checkpointStore
+            .deleteCheckpointRefs({
+              cwd: workspaceCwd,
+              checkpointRefs: [previewCheckpointRef],
+            })
+            .pipe(Effect.ignore),
+        ),
+        Effect.withSpan("checkpoint.revertPreview.diffCheckpoints"),
+      );
+
+    const turnDiff = buildTurnDiffResult(
+      {
+        threadId: input.threadId,
+        fromTurnCount: input.turnCount,
+        toTurnCount: maxTurnCount,
+      },
+      diff,
+    );
+    if (!isTurnDiffResult(turnDiff)) {
+      return yield* new CheckpointDiffResultInvalidError({
+        operation,
+        threadId: input.threadId,
+      });
+    }
+
+    return turnDiff;
+  });
+
   return CheckpointDiffQuery.of({
     getTurnDiff,
     getFullThreadDiff,
+    previewRevertDiff,
   });
 });
 

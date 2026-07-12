@@ -255,3 +255,21 @@ export function useCheckpointDiff(
   );
   return fullThreadTarget === null ? turn : fullThread;
 }
+
+// [thread-rewind] The patch a revert to `turnCount` would discard: checkpoint
+// snapshot diffed against the current workspace state (uncommitted and
+// untracked files included via an ephemeral server-side snapshot).
+export function useRevertPreviewDiff(target: {
+  readonly environmentId: EnvironmentId | null;
+  readonly threadId: ThreadId | null;
+  readonly turnCount: number | null;
+}) {
+  return useEnvironmentQuery(
+    target.environmentId !== null && target.threadId !== null && target.turnCount !== null
+      ? orchestrationEnvironment.revertPreviewDiff({
+          environmentId: target.environmentId,
+          input: { threadId: target.threadId, turnCount: target.turnCount },
+        })
+      : null,
+  );
+}

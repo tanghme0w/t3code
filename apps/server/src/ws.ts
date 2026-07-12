@@ -35,6 +35,7 @@ import {
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
   OrchestrationGetTurnDiffError,
+  OrchestrationPreviewRevertDiffError,
   ORCHESTRATION_WS_METHODS,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
@@ -280,6 +281,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.dispatchCommand, AuthOrchestrationOperateScope],
   [ORCHESTRATION_WS_METHODS.getTurnDiff, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.getFullThreadDiff, AuthOrchestrationReadScope],
+  [ORCHESTRATION_WS_METHODS.previewRevertDiff, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.replayEvents, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.subscribeShell, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot, AuthOrchestrationReadScope],
@@ -1032,6 +1034,20 @@ const makeWsRpcLayer = (
                 (cause) =>
                   new OrchestrationGetFullThreadDiffError({
                     message: "Failed to load full thread diff",
+                    cause,
+                  }),
+              ),
+            ),
+            { "rpc.aggregate": "orchestration" },
+          ),
+        [ORCHESTRATION_WS_METHODS.previewRevertDiff]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.previewRevertDiff,
+            checkpointDiffQuery.previewRevertDiff(input).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationPreviewRevertDiffError({
+                    message: "Failed to preview revert diff",
                     cause,
                   }),
               ),

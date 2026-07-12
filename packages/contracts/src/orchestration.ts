@@ -26,6 +26,7 @@ export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
   getTurnDiff: "orchestration.getTurnDiff",
   getFullThreadDiff: "orchestration.getFullThreadDiff",
+  previewRevertDiff: "orchestration.previewRevertDiff",
   replayEvents: "orchestration.replayEvents",
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
   subscribeShell: "orchestration.subscribeShell",
@@ -687,11 +688,26 @@ const ThreadUserInputRespondCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+/**
+ * `CheckpointRevertMode` — scope of a checkpoint revert.
+ *
+ * "workspace-and-conversation" (default) restores workspace files to the
+ * checkpoint snapshot and truncates the conversation. "conversation-only"
+ * truncates the conversation (and rolls back provider memory) while leaving
+ * workspace files untouched.
+ */
+export const CheckpointRevertMode = Schema.Literals([
+  "workspace-and-conversation",
+  "conversation-only",
+]);
+export type CheckpointRevertMode = typeof CheckpointRevertMode.Type;
+
 const ThreadCheckpointRevertCommand = Schema.Struct({
   type: Schema.Literal("thread.checkpoint.revert"),
   commandId: CommandId,
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  revertMode: Schema.optional(CheckpointRevertMode),
   createdAt: IsoDateTime,
 });
 
@@ -1001,6 +1017,7 @@ const ThreadUserInputResponseRequestedPayload = Schema.Struct({
 export const ThreadCheckpointRevertRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  revertMode: Schema.optional(CheckpointRevertMode),
   createdAt: IsoDateTime,
 });
 
@@ -1278,6 +1295,22 @@ export type OrchestrationGetFullThreadDiffInput = typeof OrchestrationGetFullThr
 export const OrchestrationGetFullThreadDiffResult = ThreadTurnDiff;
 export type OrchestrationGetFullThreadDiffResult = typeof OrchestrationGetFullThreadDiffResult.Type;
 
+/**
+ * Input for the revert preview diff: the patch that would be discarded by
+ * reverting the thread to `turnCount`, i.e. checkpoint `turn/<turnCount>`
+ * diffed against the current workspace state (including uncommitted and
+ * untracked files).
+ */
+export const OrchestrationPreviewRevertDiffInput = Schema.Struct({
+  threadId: ThreadId,
+  turnCount: NonNegativeInt,
+  ignoreWhitespace: Schema.optionalKey(Schema.Boolean),
+});
+export type OrchestrationPreviewRevertDiffInput = typeof OrchestrationPreviewRevertDiffInput.Type;
+
+export const OrchestrationPreviewRevertDiffResult = ThreadTurnDiff;
+export type OrchestrationPreviewRevertDiffResult = typeof OrchestrationPreviewRevertDiffResult.Type;
+
 export const OrchestrationReplayEventsInput = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
 });
@@ -1298,6 +1331,10 @@ export const OrchestrationRpcSchemas = {
   getFullThreadDiff: {
     input: OrchestrationGetFullThreadDiffInput,
     output: OrchestrationGetFullThreadDiffResult,
+  },
+  previewRevertDiff: {
+    input: OrchestrationPreviewRevertDiffInput,
+    output: OrchestrationPreviewRevertDiffResult,
   },
   replayEvents: {
     input: OrchestrationReplayEventsInput,
@@ -1343,6 +1380,14 @@ export class OrchestrationGetTurnDiffError extends Schema.TaggedErrorClass<Orche
 
 export class OrchestrationGetFullThreadDiffError extends Schema.TaggedErrorClass<OrchestrationGetFullThreadDiffError>()(
   "OrchestrationGetFullThreadDiffError",
+  {
+    message: TrimmedNonEmptyString,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {}
+
+export class OrchestrationPreviewRevertDiffError extends Schema.TaggedErrorClass<OrchestrationPreviewRevertDiffError>()(
+  "OrchestrationPreviewRevertDiffError",
   {
     message: TrimmedNonEmptyString,
     cause: Schema.optional(Schema.Defect()),

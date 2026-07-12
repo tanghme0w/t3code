@@ -16,6 +16,7 @@ import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   buildExpiredTerminalContextToastCopy,
   buildThreadTurnInterruptInput,
+  countDiscardedMessages, // [thread-rewind]
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   deriveRewindTargets,
@@ -25,6 +26,7 @@ import {
   reconcileRetainedMountedThreadIds,
   resolveSendEnvMode,
   shouldWriteThreadErrorToCurrentServerThread,
+  summarizeUnifiedDiff, // [thread-rewind]
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -625,5 +627,60 @@ describe("deriveRewindTargets", () => {
 
     expect(targets.revertTurnCountByUserMessageId.size).toBe(0);
     expect(targets.retryContextByAssistantMessageId.size).toBe(0);
+  });
+});
+
+// [thread-rewind] ------------------------------------------------------------
+
+describe("summarizeUnifiedDiff", () => {
+  it("summarizes per-file additions and deletions, ignoring file headers", () => {
+    const patch = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "index 1111111..2222222 100644",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " unchanged",
+      "+added line",
+      "+another added",
+      "-removed line",
+      "diff --git a/docs/old.md b/docs/new.md",
+      "similarity index 90%",
+      "rename from docs/old.md",
+      "rename to docs/new.md",
+      "--- a/docs/old.md",
+      "+++ b/docs/new.md",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+
+    const summary = summarizeUnifiedDiff(patch);
+
+    expect(summary.files).toEqual([
+      { path: "src/a.ts", additions: 2, deletions: 1 },
+      { path: "docs/new.md", additions: 1, deletions: 1 },
+    ]);
+    expect(summary.additions).toBe(3);
+    expect(summary.deletions).toBe(2);
+  });
+
+  it("returns an empty summary for an empty patch", () => {
+    expect(summarizeUnifiedDiff("")).toEqual({ files: [], additions: 0, deletions: 0 });
+  });
+});
+
+describe("countDiscardedMessages", () => {
+  it("counts messages at or after the anchor timestamp — the timeline dim rule", () => {
+    const messages = [
+      { createdAt: "2026-07-12T10:00:00.000Z" },
+      { createdAt: "2026-07-12T10:01:00.000Z" },
+      { createdAt: "2026-07-12T10:02:00.000Z" },
+    ];
+
+    expect(countDiscardedMessages(messages, "2026-07-12T10:01:00.000Z")).toBe(2);
+    expect(countDiscardedMessages(messages, "2026-07-12T09:00:00.000Z")).toBe(3);
+    expect(countDiscardedMessages(messages, "2026-07-12T11:00:00.000Z")).toBe(0);
+    expect(countDiscardedMessages([], "2026-07-12T10:00:00.000Z")).toBe(0);
   });
 });

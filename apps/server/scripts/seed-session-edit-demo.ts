@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Standalone CLI seeder does imperative fs/git setup before an Effect runtime exists.
 /**
  * seed-session-edit-demo — preloads a demo home + git workspace with threads
  * covering the session-editing edge cases addressed on the session-edit-ops
@@ -31,6 +32,7 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
@@ -47,8 +49,8 @@ function readArg(name: string): string {
   const index = process.argv.indexOf(`--${name}`);
   const value = index >= 0 ? process.argv[index + 1] : undefined;
   if (!value) {
-    console.error(
-      "Usage: node apps/server/scripts/seed-session-edit-demo.ts --home <dir> --workspace <dir>",
+    process.stderr.write(
+      "Usage: node apps/server/scripts/seed-session-edit-demo.ts --home <dir> --workspace <dir>\n",
     );
     process.exit(1);
   }
@@ -63,7 +65,7 @@ const seededMarkerPath = NodePath.join(stateDir, ".session-edit-demo-seeded");
 const workspaceMarkerPath = NodePath.join(workspaceDir, ".session-edit-demo");
 
 if (NodeFS.existsSync(seededMarkerPath)) {
-  console.log(`Already seeded (${seededMarkerPath} exists) — nothing to do.`);
+  process.stdout.write(`Already seeded (${seededMarkerPath} exists) — nothing to do.\n`);
   process.exit(0);
 }
 
@@ -109,8 +111,8 @@ function commitAll(message: string): string {
 
 if (NodeFS.existsSync(workspaceDir)) {
   if (!NodeFS.existsSync(workspaceMarkerPath)) {
-    console.error(
-      `Refusing to reuse ${workspaceDir}: it exists but was not created by this seeder.`,
+    process.stderr.write(
+      `Refusing to reuse ${workspaceDir}: it exists but was not created by this seeder.\n`,
     );
     process.exit(1);
   }
@@ -201,7 +203,7 @@ writeWorkspaceFile("中断残留的草稿.tmp", "被打断时留下的临时文�
 
 let clockMs = Date.parse("2026-07-12T01:00:00.000Z");
 function stamp(): string {
-  const iso = new Date(clockMs).toISOString();
+  const iso = DateTime.formatIso(DateTime.makeUnsafe(clockMs));
   clockMs += 30_000;
   return iso;
 }
@@ -391,9 +393,12 @@ function completedExchange(input: {
   readonly attachments?: ReadonlyArray<ChatAttachment>;
 }): void {
   const turnId = TurnId.make(`${input.slug}-turn-${input.turnNumber}`);
-  sendUserMessage(input.threadId, `${input.slug}-user-${input.turnNumber}`, input.userText, {
-    ...(input.attachments ? { attachments: input.attachments } : {}),
-  });
+  sendUserMessage(
+    input.threadId,
+    `${input.slug}-user-${input.turnNumber}`,
+    input.userText,
+    input.attachments ? { attachments: input.attachments } : {},
+  );
   setSession(input.threadId, "running", turnId);
   sendAssistantMessage(
     input.threadId,
@@ -588,8 +593,8 @@ const MainLayer = OrchestrationEventStoreLive.pipe(
 await Effect.runPromise(program.pipe(Effect.provide(MainLayer), Effect.scoped));
 
 NodeFS.mkdirSync(NodePath.dirname(seededMarkerPath), { recursive: true });
-NodeFS.writeFileSync(seededMarkerPath, `${new Date().toISOString()}\n`, "utf8");
+NodeFS.writeFileSync(seededMarkerPath, `${DateTime.formatIso(DateTime.nowUnsafe())}\n`, "utf8");
 
-console.log(`Seeded ${events.length} events into ${dbPath}`);
-console.log(`Demo workspace ready at ${workspaceDir}`);
-console.log(`Threads: ${Object.values(THREADS).join(", ")}`);
+process.stdout.write(`Seeded ${events.length} events into ${dbPath}\n`);
+process.stdout.write(`Demo workspace ready at ${workspaceDir}\n`);
+process.stdout.write(`Threads: ${Object.values(THREADS).join(", ")}\n`);
