@@ -3,7 +3,7 @@
 A pinned right-hand rail beside the conversation column that shows the
 thread's harness-tracked tasks (subagents, background work) with live status —
 modeled on Codex's pinned-summary layout. When the rail is open the
-conversation column (timeline *and* composer) yields width and re-centers in
+conversation column (timeline _and_ composer) yields width and re-centers in
 the remaining space, mirroring the left sidebar as a three-column layout.
 There is never overlay/occlusion: the rail participates in the chat area's
 flex row.
