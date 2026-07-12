@@ -66,23 +66,64 @@ function turnSortKey(turn: ProjectionTurn): string {
   return turn.requestedAt;
 }
 
-/** Turns strictly before the exclusive cut turn; all turns when cut is null/unknown. */
+/**
+ * Resolves the exclusive fork cut over the source turns.
+ *
+ * `atMessageId` is the authoritative boundary when present: the message
+ * itself, any turn it started, and every turn requested at or after it are
+ * excluded. `atTurnId` additionally cuts strictly before that turn; both
+ * constraints intersect, so a mis-derived later turn id can never widen the
+ * copy past the boundary message. With neither, the whole history is kept
+ * (tip fork).
+ *
+ * Returns the kept turns plus the createdAt cutoff used for turnless rows
+ * (user messages and activities carry no turnId, so they are cut by time).
+ */
 function selectKeptTurns(
   turns: ReadonlyArray<ProjectionTurn>,
-  atTurnId: TurnId | null,
-): { kept: ReadonlyArray<ProjectionTurn>; cutTurn: ProjectionTurn | undefined } {
-  const ordered = [...turns].sort((a, b) => turnSortKey(a).localeCompare(turnSortKey(b)));
-  if (atTurnId === null) {
-    return { kept: ordered, cutTurn: undefined };
-  }
-  const cutTurn = ordered.find((turn) => turn.turnId === atTurnId);
-  if (!cutTurn) {
-    return { kept: ordered, cutTurn: undefined };
-  }
-  return {
-    kept: ordered.filter((turn) => turnSortKey(turn) < turnSortKey(cutTurn)),
-    cutTurn,
-  };
+  messages: ReadonlyArray<ProjectionThreadMessage>,
+  cut: { readonly atTurnId: TurnId | null; readonly atMessageId: MessageId | null },
+): { kept: ReadonlyArray<ProjectionTurn>; cutoffCreatedAt: string | undefined } {
+  const ordered = [...turns].sort(
+    (a, b) =>
+      turnSortKey(a).localeCompare(turnSortKey(b)) ||
+      String(a.turnId ?? "").localeCompare(String(b.turnId ?? "")),
+  );
+
+  const cutMessage =
+    cut.atMessageId === null
+      ? undefined
+      : messages.find((message) => message.messageId === cut.atMessageId);
+  const cutTurn =
+    cut.atTurnId === null ? undefined : ordered.find((turn) => turn.turnId === cut.atTurnId);
+  const cutTurnIndex = cutTurn === undefined ? undefined : ordered.indexOf(cutTurn);
+
+  // Turnless rows are cut by time. The cut message's own createdAt is
+  // authoritative; the cut turn's user message comes next; the turn's
+  // requestedAt is the weakest fallback — turns materialized without a
+  // pending message carry a requestedAt LATER than their user message,
+  // which would otherwise leak the boundary message into the fork.
+  const cutPendingMessage =
+    cutTurn?.pendingMessageId != null
+      ? messages.find((message) => message.messageId === cutTurn.pendingMessageId)
+      : undefined;
+  const cutoffCreatedAt =
+    cutMessage?.createdAt ?? cutPendingMessage?.createdAt ?? cutTurn?.requestedAt;
+
+  const kept = ordered.filter((turn, index) => {
+    if (cutTurnIndex !== undefined && index >= cutTurnIndex) {
+      return false;
+    }
+    if (cut.atMessageId !== null && turn.pendingMessageId === cut.atMessageId) {
+      return false;
+    }
+    if (cutMessage !== undefined && turn.requestedAt >= cutMessage.createdAt) {
+      return false;
+    }
+    return true;
+  });
+
+  return { kept, cutoffCreatedAt };
 }
 
 const CLONED_TURN_STATES: Record<ProjectionTurn["state"], ProjectionTurn["state"]> = {
@@ -102,30 +143,33 @@ export const applyThreadForkProjection = (deps: ThreadForkProjectionDeps) =>
     const sourceMessages = yield* deps.messages.listByThreadId({ threadId: sourceThreadId });
     const sourceActivities = yield* deps.activities.listByThreadId({ threadId: sourceThreadId });
 
-    const { kept: keptTurns, cutTurn } = selectKeptTurns(sourceTurns, event.payload.atTurnId);
+    const atMessageId = event.payload.atMessageId ?? null;
+    const { kept: keptTurns, cutoffCreatedAt } = selectKeptTurns(sourceTurns, sourceMessages, {
+      atTurnId: event.payload.atTurnId,
+      atMessageId,
+    });
     const keptTurnIds = new Set<TurnId>();
     for (const turn of keptTurns) {
       if (turn.turnId !== null) keptTurnIds.add(turn.turnId);
     }
 
     // User messages carry no turnId in projections (the turn references them
-    // via pendingMessageId), so turnless rows are cut by time. The boundary
-    // is the cut turn's own user message — it must be excluded too, hence
-    // its createdAt (not the later turn requestedAt) when resolvable.
-    const cutPendingMessage =
-      cutTurn?.pendingMessageId != null
-        ? sourceMessages.find((message) => message.messageId === cutTurn.pendingMessageId)
-        : undefined;
-    const cutoffCreatedAt = cutPendingMessage?.createdAt ?? cutTurn?.requestedAt;
+    // via pendingMessageId), so turnless rows are cut by time; the boundary
+    // message itself is always excluded, even when no cutoff resolves.
     const keepsUnturned = (createdAt: string): boolean =>
       cutoffCreatedAt === undefined || createdAt < cutoffCreatedAt;
 
     const remapMessageId = (id: MessageId | null): MessageId | null =>
       id === null ? null : forkedMessageId(forkThreadId, id);
 
-    const keptMessages = sourceMessages.filter((message) =>
-      message.turnId === null ? keepsUnturned(message.createdAt) : keptTurnIds.has(message.turnId),
-    );
+    const keptMessages = sourceMessages.filter((message) => {
+      if (atMessageId !== null && message.messageId === atMessageId) {
+        return false;
+      }
+      return message.turnId === null
+        ? keepsUnturned(message.createdAt)
+        : keptTurnIds.has(message.turnId);
+    });
 
     for (const message of keptMessages) {
       const cloned: ProjectionThreadMessage = {

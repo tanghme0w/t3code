@@ -887,38 +887,264 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
   ),
 );
 
+// [thread-rewind] Conversation-only mode: the thread (and provider memory)
+// rewinds, stale checkpoint refs are still pruned, but workspace files stay
+// exactly as they are.
+it.live("conversation-only revert keeps workspace files while trimming the thread", () =>
+  withHarness((harness) =>
+    Effect.gen(function* () {
+      yield* seedProjectAndThread(harness);
+
+      yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("evt-conv-revert-1", "2026-02-24T10:07:00.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "message.delta",
+            ...runtimeBase("evt-conv-revert-1a", "2026-02-24T10:07:00.050Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            delta: "Updated README to v2.\n",
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("evt-conv-revert-2", "2026-02-24T10:07:00.100Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+        mutateWorkspace: ({ cwd }) =>
+          Effect.sync(() => {
+            NodeFS.writeFileSync(NodePath.join(cwd, "README.md"), "v2\n", "utf8");
+          }),
+      });
+      yield* startTurn({
+        harness,
+        commandId: "cmd-turn-start-conv-revert-1",
+        messageId: "msg-user-conv-revert-1",
+        text: "First edit",
+        createdAt: "2026-02-24T10:06:59.900Z",
+      });
+
+      yield* harness.waitForThread(
+        THREAD_ID,
+        (entry) => entry.session?.threadId === "thread-1" && entry.checkpoints.length === 1,
+      );
+
+      yield* harness.adapterHarness!.queueTurnResponse(THREAD_ID, {
+        events: [
+          {
+            type: "turn.started",
+            ...runtimeBase("evt-conv-revert-3", "2026-02-24T10:07:01.000Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+          },
+          {
+            type: "message.delta",
+            ...runtimeBase("evt-conv-revert-3a", "2026-02-24T10:07:01.050Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            delta: "Updated README to v3.\n",
+          },
+          {
+            type: "turn.completed",
+            ...runtimeBase("evt-conv-revert-4", "2026-02-24T10:07:01.100Z"),
+            threadId: THREAD_ID,
+            turnId: FIXTURE_TURN_ID,
+            status: "completed",
+          },
+        ],
+        mutateWorkspace: ({ cwd }) =>
+          Effect.sync(() => {
+            NodeFS.writeFileSync(NodePath.join(cwd, "README.md"), "v3\n", "utf8");
+          }),
+      });
+      yield* startTurn({
+        harness,
+        commandId: "cmd-turn-start-conv-revert-2",
+        messageId: "msg-user-conv-revert-2",
+        text: "Second edit",
+        createdAt: "2026-02-24T10:07:00.900Z",
+      });
+
+      yield* harness.waitForThread(
+        THREAD_ID,
+        (entry) => entry.latestTurn?.turnId === "turn-2" && entry.checkpoints.length === 2,
+        8000,
+      );
+
+      yield* harness.engine.dispatch({
+        type: "thread.checkpoint.revert",
+        commandId: CommandId.make("cmd-checkpoint-revert-conversation-only"),
+        threadId: THREAD_ID,
+        turnCount: 1,
+        revertMode: "conversation-only",
+        createdAt: nowIso(),
+      });
+
+      yield* harness.waitForDomainEvent((event) => event.type === "thread.reverted");
+      const revertedThread = yield* harness.waitForThread(
+        THREAD_ID,
+        (entry) =>
+          entry.checkpoints.length === 1 && entry.checkpoints[0]?.checkpointTurnCount === 1,
+      );
+      assert.deepEqual(
+        revertedThread.messages.map((message) => ({ role: message.role, text: message.text })),
+        [
+          { role: "user", text: "First edit" },
+          { role: "assistant", text: "Updated README to v2.\n" },
+        ],
+      );
+      // Workspace untouched: still v3 even though the conversation is back at
+      // the first exchange.
+      assert.equal(
+        NodeFS.readFileSync(NodePath.join(harness.workspaceDir, "README.md"), "utf8"),
+        "v3\n",
+      );
+      // Stale refs are still pruned and provider memory still rolls back.
+      assert.equal(
+        gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 2)),
+        false,
+      );
+      assert.equal(
+        gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 1)),
+        true,
+      );
+      assert.deepEqual(harness.adapterHarness!.getRollbackCalls(THREAD_ID), [1]);
+    }),
+  ),
+);
+
 it.live(
-  "appends checkpoint.revert.failed activity when revert is requested without an active session",
+  "reverts checkpoints via the workspace cwd fallback when no provider session is active",
   () =>
     withHarness((harness) =>
       Effect.gen(function* () {
         yield* seedProjectAndThread(harness);
 
+        yield* harness.adapterHarness!.queueTurnResponseForNextSession({
+          events: [
+            {
+              type: "turn.started",
+              ...runtimeBase("evt-cold-revert-1", "2026-02-24T10:06:00.000Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+            },
+            {
+              type: "message.delta",
+              ...runtimeBase("evt-cold-revert-2", "2026-02-24T10:06:00.050Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+              delta: "Updated README to v2.\n",
+            },
+            {
+              type: "turn.completed",
+              ...runtimeBase("evt-cold-revert-3", "2026-02-24T10:06:00.100Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+              status: "completed",
+            },
+          ],
+          mutateWorkspace: ({ cwd }) =>
+            Effect.sync(() => {
+              NodeFS.writeFileSync(NodePath.join(cwd, "README.md"), "v2\n", "utf8");
+            }),
+        });
+        yield* startTurn({
+          harness,
+          commandId: "cmd-turn-start-cold-revert-1",
+          messageId: "msg-user-cold-revert-1",
+          text: "First edit",
+          createdAt: "2026-02-24T10:05:59.900Z",
+        });
+        yield* harness.waitForThread(THREAD_ID, (entry) => entry.checkpoints.length === 1);
+
+        yield* harness.adapterHarness!.queueTurnResponse(THREAD_ID, {
+          events: [
+            {
+              type: "turn.started",
+              ...runtimeBase("evt-cold-revert-4", "2026-02-24T10:06:01.000Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+            },
+            {
+              type: "message.delta",
+              ...runtimeBase("evt-cold-revert-5", "2026-02-24T10:06:01.050Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+              delta: "Updated README to v3.\n",
+            },
+            {
+              type: "turn.completed",
+              ...runtimeBase("evt-cold-revert-6", "2026-02-24T10:06:01.100Z"),
+              threadId: THREAD_ID,
+              turnId: FIXTURE_TURN_ID,
+              status: "completed",
+            },
+          ],
+          mutateWorkspace: ({ cwd }) =>
+            Effect.sync(() => {
+              NodeFS.writeFileSync(NodePath.join(cwd, "README.md"), "v3\n", "utf8");
+            }),
+        });
+        yield* startTurn({
+          harness,
+          commandId: "cmd-turn-start-cold-revert-2",
+          messageId: "msg-user-cold-revert-2",
+          text: "Second edit",
+          createdAt: "2026-02-24T10:06:00.900Z",
+        });
+        yield* harness.waitForThread(THREAD_ID, (entry) => entry.checkpoints.length === 2, 8000);
+
+        // Stop the provider session so no live session is bound to the thread;
+        // the revert must fall back to the thread/project workspace cwd.
+        yield* harness.engine.dispatch({
+          type: "thread.session.stop",
+          commandId: CommandId.make("cmd-session-stop-cold-revert"),
+          threadId: THREAD_ID,
+          createdAt: nowIso(),
+        });
+        yield* harness.waitForThread(THREAD_ID, (entry) => entry.session?.status === "stopped");
+
         yield* harness.engine.dispatch({
           type: "thread.checkpoint.revert",
           commandId: CommandId.make("cmd-checkpoint-revert-no-session"),
           threadId: THREAD_ID,
-          turnCount: 0,
+          turnCount: 1,
           createdAt: nowIso(),
         });
 
-        const thread = yield* harness.waitForThread(THREAD_ID, (entry) =>
-          entry.activities.some(
-            (activity) =>
-              activity.kind === "checkpoint.revert.failed" &&
-              typeof activity.payload === "object" &&
-              activity.payload !== null,
-          ),
+        yield* harness.waitForDomainEvent((event) => event.type === "thread.reverted");
+        const revertedThread = yield* harness.waitForThread(
+          THREAD_ID,
+          (entry) =>
+            entry.checkpoints.length === 1 && entry.checkpoints[0]?.checkpointTurnCount === 1,
         );
-        const failureActivity = thread.activities.find(
-          (activity) => activity.kind === "checkpoint.revert.failed",
-        );
-        assert.equal(failureActivity !== undefined, true);
         assert.equal(
-          String(
-            (failureActivity?.payload as { readonly detail?: string } | undefined)?.detail,
-          ).includes("No active provider session"),
-          true,
+          revertedThread.activities.some(
+            (activity) => activity.kind === "checkpoint.revert.failed",
+          ),
+          false,
+        );
+        assert.deepEqual(
+          revertedThread.messages.map((message) => ({ role: message.role, text: message.text })),
+          [
+            { role: "user", text: "First edit" },
+            { role: "assistant", text: "Updated README to v2.\n" },
+          ],
+        );
+        assert.equal(
+          NodeFS.readFileSync(NodePath.join(harness.workspaceDir, "README.md"), "utf8"),
+          "v2\n",
+        );
+        assert.equal(
+          gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 2)),
+          false,
         );
       }),
     ),

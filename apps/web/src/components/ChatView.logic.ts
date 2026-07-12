@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   isProviderDriverKind,
+  type MessageId,
   ProjectId,
   type ModelSelection,
   type ProviderDriverKind,
@@ -9,7 +10,8 @@ import {
   type ThreadId,
   type TurnId,
 } from "@t3tools/contracts";
-import { type ChatMessage, type SessionPhase, type Thread } from "../types";
+import { type ChatMessage, type SessionPhase, type Thread, type TurnDiffSummary } from "../types";
+import { type TimelineEntry } from "../session-logic";
 import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
@@ -361,6 +363,167 @@ export async function waitForServerThreadExists(
   );
 }
 
+// [thread-retry] Everything needed to re-run an assistant response: rewind
+// to the checkpoint just before its user message, then resend that prompt.
+export interface RetryMessageContext {
+  readonly userMessageId: MessageId;
+  readonly text: string;
+  readonly hasAttachments: boolean;
+  readonly targetTurnCount: number;
+}
+
+export interface RewindTargets {
+  readonly revertTurnCountByUserMessageId: Map<MessageId, number>;
+  readonly retryContextByAssistantMessageId: Map<MessageId, RetryMessageContext>;
+}
+
+// A user message's rewind target is the checkpoint state just BEFORE it —
+// i.e. the last checkpoint seen while walking the timeline up to that
+// message. Walking forward with a running count (instead of requiring the
+// message's own turn to have completed a checkpoint) keeps edit/retry
+// available when a turn was interrupted or errored before its checkpoint
+// landed. Threads without any checkpoint coverage (non-git workspaces)
+// expose no targets at all, matching where reverts can actually run.
+export function deriveRewindTargets(input: {
+  readonly timelineEntries: ReadonlyArray<TimelineEntry>;
+  readonly turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
+  readonly inferredCheckpointTurnCountByTurnId: Readonly<Record<string, number | undefined>>;
+  readonly checkpointCount: number;
+}): RewindTargets {
+  const revertTurnCountByUserMessageId = new Map<MessageId, number>();
+  const retryContextByAssistantMessageId = new Map<MessageId, RetryMessageContext>();
+  if (input.checkpointCount === 0) {
+    return { revertTurnCountByUserMessageId, retryContextByAssistantMessageId };
+  }
+
+  let checkpointTurnCountSoFar = 0;
+  let currentUserMessage: { readonly message: ChatMessage; readonly target: number } | null = null;
+  for (const entry of input.timelineEntries) {
+    if (!entry || entry.kind !== "message") {
+      continue;
+    }
+    const message = entry.message;
+    if (message.role === "user") {
+      currentUserMessage = { message, target: checkpointTurnCountSoFar };
+      revertTurnCountByUserMessageId.set(message.id, checkpointTurnCountSoFar);
+      continue;
+    }
+    if (message.role !== "assistant") {
+      continue;
+    }
+    if (currentUserMessage !== null) {
+      retryContextByAssistantMessageId.set(message.id, {
+        userMessageId: currentUserMessage.message.id,
+        text: currentUserMessage.message.text,
+        hasAttachments: (currentUserMessage.message.attachments?.length ?? 0) > 0,
+        targetTurnCount: currentUserMessage.target,
+      });
+    }
+    const summary = input.turnDiffSummaryByAssistantMessageId.get(message.id);
+    const turnCount = summary
+      ? (summary.checkpointTurnCount ?? input.inferredCheckpointTurnCountByTurnId[summary.turnId])
+      : undefined;
+    if (typeof turnCount === "number") {
+      checkpointTurnCountSoFar = Math.max(checkpointTurnCountSoFar, turnCount);
+    }
+  }
+
+  return { revertTurnCountByUserMessageId, retryContextByAssistantMessageId };
+}
+
+export type ThreadRevertWaitOutcome =
+  | { readonly outcome: "reverted" }
+  | { readonly outcome: "failed"; readonly detail: string }
+  | { readonly outcome: "timeout" };
+
+// [edit-message] Deferred-discard edits and retries dispatch the checkpoint
+// revert only at send time, so the follow-up turn must wait until the revert
+// has actually applied — otherwise the freshly sent message races the
+// truncation (and the provider rollback). The revert has no dedicated client
+// receipt; its two observable outcomes on the thread detail atom are:
+// - success: `thread.reverted` projects and the discarded message disappears;
+// - failure: the server appends a `checkpoint.revert.failed` activity.
+export async function waitForThreadRevertOutcome(
+  threadRef: ScopedThreadRef,
+  input: {
+    readonly discardedMessageId: string;
+    readonly timeoutMs?: number;
+  },
+): Promise<ThreadRevertWaitOutcome> {
+  const timeoutMs = input.timeoutMs ?? 15_000;
+  const threadAtom = environmentThreadDetails.detailAtom(threadRef);
+  const getThread = () => appAtomRegistry.get(threadAtom);
+
+  const preexistingFailureIds = new Set(
+    (getThread()?.activities ?? [])
+      .filter((activity) => activity.kind === "checkpoint.revert.failed")
+      .map((activity) => activity.id),
+  );
+
+  const resolveOutcome = (thread: Thread | null | undefined): ThreadRevertWaitOutcome | null => {
+    if (!thread) {
+      return null;
+    }
+    const failure = thread.activities.find(
+      (activity) =>
+        activity.kind === "checkpoint.revert.failed" && !preexistingFailureIds.has(activity.id),
+    );
+    if (failure) {
+      const payload = failure.payload;
+      const detail =
+        typeof payload === "object" &&
+        payload !== null &&
+        "detail" in payload &&
+        typeof (payload as { detail?: unknown }).detail === "string"
+          ? (payload as { detail: string }).detail
+          : failure.summary;
+      return { outcome: "failed", detail };
+    }
+    if (!thread.messages.some((message) => message.id === input.discardedMessageId)) {
+      return { outcome: "reverted" };
+    }
+    return null;
+  };
+
+  const immediate = resolveOutcome(getThread());
+  if (immediate) {
+    return immediate;
+  }
+
+  return await new Promise<ThreadRevertWaitOutcome>((resolve) => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const finish = (result: ThreadRevertWaitOutcome) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (timeoutId !== null) {
+        globalThis.clearTimeout(timeoutId);
+      }
+      unsubscribe();
+      resolve(result);
+    };
+
+    const unsubscribe = appAtomRegistry.subscribe(threadAtom, (thread) => {
+      const result = resolveOutcome(thread);
+      if (result) {
+        finish(result);
+      }
+    });
+
+    const afterSubscribe = resolveOutcome(getThread());
+    if (afterSubscribe) {
+      finish(afterSubscribe);
+      return;
+    }
+
+    timeoutId = globalThis.setTimeout(() => {
+      finish({ outcome: "timeout" });
+    }, timeoutMs);
+  });
+}
+
 async function waitForServerThreadCondition(
   threadRef: ScopedThreadRef,
   predicate: (thread: Thread | null | undefined) => boolean,
@@ -480,5 +643,73 @@ export function hasServerAcknowledgedLocalDispatch(input: {
     latestTurnChanged ||
     input.localDispatch.sessionStatus !== (session?.status ?? null) ||
     input.localDispatch.sessionUpdatedAt !== (session?.updatedAt ?? null)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// [thread-rewind] Revert preview helpers
+// ---------------------------------------------------------------------------
+
+export interface UnifiedDiffFileSummary {
+  readonly path: string;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+export interface UnifiedDiffSummary {
+  readonly files: ReadonlyArray<UnifiedDiffFileSummary>;
+  readonly additions: number;
+  readonly deletions: number;
+}
+
+const DIFF_GIT_HEADER = /^diff --git a\/(.+?) b\/(.+)$/;
+
+/**
+ * Compact per-file summary of a unified diff patch for the rewind preview
+ * dialog. Counts added/removed lines per `diff --git` section, ignoring the
+ * `+++`/`---` file headers. Rename sections report the new path.
+ */
+export function summarizeUnifiedDiff(patch: string): UnifiedDiffSummary {
+  const files: Array<{ path: string; additions: number; deletions: number }> = [];
+  let current: { path: string; additions: number; deletions: number } | null = null;
+  for (const line of patch.split("\n")) {
+    const header = DIFF_GIT_HEADER.exec(line);
+    if (header) {
+      if (current) {
+        files.push(current);
+      }
+      current = { path: header[2] ?? header[1] ?? "unknown", additions: 0, deletions: 0 };
+      continue;
+    }
+    if (!current || line.startsWith("+++") || line.startsWith("---")) {
+      continue;
+    }
+    if (line.startsWith("+")) {
+      current.additions += 1;
+    } else if (line.startsWith("-")) {
+      current.deletions += 1;
+    }
+  }
+  if (current) {
+    files.push(current);
+  }
+  return {
+    files,
+    additions: files.reduce((sum, file) => sum + file.additions, 0),
+    deletions: files.reduce((sum, file) => sum + file.deletions, 0),
+  };
+}
+
+/**
+ * How many thread messages a rewind anchored at `fromCreatedAt` discards —
+ * the same boundary rule the timeline uses to dim rows during an edit.
+ */
+export function countDiscardedMessages(
+  messages: ReadonlyArray<{ readonly createdAt: string }>,
+  fromCreatedAt: string,
+): number {
+  return messages.reduce(
+    (count, message) => (message.createdAt >= fromCreatedAt ? count + 1 : count),
+    0,
   );
 }

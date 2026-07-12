@@ -1,4 +1,10 @@
-import { CheckpointRef, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  ProjectId,
+  ThreadId,
+  TurnId,
+  VcsUnsupportedOperationError,
+} from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -426,6 +432,170 @@ describe("CheckpointDiffQuery.layer", () => {
       expect(error.message).toBe(
         "Checkpoint invariant violation in CheckpointDiffQuery.getTurnDiff: Thread 'thread-missing' not found.",
       );
+    }),
+  );
+});
+
+// [thread-rewind] ------------------------------------------------------------
+
+function makePreviewSnapshotQuery(
+  threadCheckpointContext: ProjectionSnapshotQuery.ProjectionThreadCheckpointContext,
+): ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"] {
+  return {
+    getCommandReadModel: () =>
+      Effect.die("CheckpointDiffQuery should not request the command read model"),
+    getSnapshot: () =>
+      Effect.die("CheckpointDiffQuery should not request the full orchestration snapshot"),
+    getShellSnapshot: () =>
+      Effect.die("CheckpointDiffQuery should not request the orchestration shell snapshot"),
+    getArchivedShellSnapshot: () =>
+      Effect.die("CheckpointDiffQuery should not request archived shell snapshots"),
+    getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
+    getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
+    getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
+    getProjectShellById: () => Effect.succeed(Option.none()),
+    getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
+    getThreadCheckpointContext: () => Effect.succeed(Option.some(threadCheckpointContext)),
+    getFullThreadDiffContext: () => Effect.die("unused"),
+    getThreadShellById: () => Effect.succeed(Option.none()),
+    getThreadDetailById: () => Effect.succeed(Option.none()),
+    getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
+  };
+}
+
+describe("CheckpointDiffQuery.previewRevertDiff", () => {
+  it.effect(
+    "snapshots the workspace, diffs from the target checkpoint, and deletes the ephemeral ref",
+    () =>
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("project-preview");
+        const threadId = ThreadId.make("thread-preview");
+        const targetCheckpointRef = checkpointRefForThreadTurn(threadId, 1);
+        const capturedRefs: Array<string> = [];
+        const deletedRefs: Array<ReadonlyArray<string>> = [];
+        const diffCalls: Array<{
+          readonly from: string;
+          readonly to: string;
+          readonly fallbackFromToHead: boolean | undefined;
+        }> = [];
+
+        const threadCheckpointContext = makeThreadCheckpointContext({
+          projectId,
+          threadId,
+          workspaceRoot: "/tmp/workspace",
+          worktreePath: null,
+          checkpointTurnCount: 1,
+          checkpointRef: targetCheckpointRef,
+        });
+
+        const checkpointStore: CheckpointStore.CheckpointStore["Service"] = {
+          isGitRepository: () => Effect.succeed(true),
+          captureCheckpoint: ({ checkpointRef }) =>
+            Effect.sync(() => {
+              capturedRefs.push(checkpointRef);
+            }),
+          hasCheckpointRef: () => Effect.succeed(true),
+          restoreCheckpoint: () => Effect.succeed(true),
+          diffCheckpoints: ({ fromCheckpointRef, toCheckpointRef, fallbackFromToHead }) =>
+            Effect.sync(() => {
+              diffCalls.push({
+                from: fromCheckpointRef,
+                to: toCheckpointRef,
+                fallbackFromToHead,
+              });
+              return "revert preview patch";
+            }),
+          deleteCheckpointRefs: ({ checkpointRefs }) =>
+            Effect.sync(() => {
+              deletedRefs.push(checkpointRefs);
+            }),
+        };
+
+        const layer = CheckpointDiffQuery.layer.pipe(
+          Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
+          Layer.provideMerge(
+            Layer.succeed(
+              ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+              makePreviewSnapshotQuery(threadCheckpointContext),
+            ),
+          ),
+        );
+
+        const result = yield* Effect.gen(function* () {
+          const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+          return yield* query.previewRevertDiff({ threadId, turnCount: 1 });
+        }).pipe(Effect.provide(layer));
+
+        expect(result).toEqual({
+          threadId,
+          fromTurnCount: 1,
+          toTurnCount: 1,
+          diff: "revert preview patch",
+        });
+        expect(capturedRefs).toHaveLength(1);
+        expect(capturedRefs[0]).toContain("/preview/");
+        expect(diffCalls).toEqual([
+          { from: targetCheckpointRef, to: capturedRefs[0], fallbackFromToHead: false },
+        ]);
+        expect(deletedRefs).toEqual([[capturedRefs[0]]]);
+      }),
+  );
+
+  it.effect("deletes the ephemeral snapshot ref even when diffing fails", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-preview-fail");
+      const threadId = ThreadId.make("thread-preview-fail");
+      const targetCheckpointRef = checkpointRefForThreadTurn(threadId, 1);
+      const capturedRefs: Array<string> = [];
+      const deletedRefs: Array<ReadonlyArray<string>> = [];
+
+      const threadCheckpointContext = makeThreadCheckpointContext({
+        projectId,
+        threadId,
+        workspaceRoot: "/tmp/workspace",
+        worktreePath: null,
+        checkpointTurnCount: 1,
+        checkpointRef: targetCheckpointRef,
+      });
+
+      const checkpointStore: CheckpointStore.CheckpointStore["Service"] = {
+        isGitRepository: () => Effect.succeed(true),
+        captureCheckpoint: ({ checkpointRef }) =>
+          Effect.sync(() => {
+            capturedRefs.push(checkpointRef);
+          }),
+        hasCheckpointRef: () => Effect.succeed(true),
+        restoreCheckpoint: () => Effect.succeed(true),
+        diffCheckpoints: () =>
+          new VcsUnsupportedOperationError({
+            operation: "test.diffCheckpoints",
+            kind: "git",
+            detail: "boom",
+          }),
+        deleteCheckpointRefs: ({ checkpointRefs }) =>
+          Effect.sync(() => {
+            deletedRefs.push(checkpointRefs);
+          }),
+      };
+
+      const layer = CheckpointDiffQuery.layer.pipe(
+        Layer.provideMerge(Layer.succeed(CheckpointStore.CheckpointStore, checkpointStore)),
+        Layer.provideMerge(
+          Layer.succeed(
+            ProjectionSnapshotQuery.ProjectionSnapshotQuery,
+            makePreviewSnapshotQuery(threadCheckpointContext),
+          ),
+        ),
+      );
+
+      const error = yield* Effect.gen(function* () {
+        const query = yield* CheckpointDiffQuery.CheckpointDiffQuery;
+        return yield* query.previewRevertDiff({ threadId, turnCount: 1 });
+      }).pipe(Effect.provide(layer), Effect.flip);
+
+      expect(error).toBeInstanceOf(VcsUnsupportedOperationError);
+      expect(capturedRefs).toHaveLength(1);
+      expect(deletedRefs).toEqual([[capturedRefs[0]]]);
     }),
   );
 });

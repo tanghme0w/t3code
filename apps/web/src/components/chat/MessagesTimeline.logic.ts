@@ -94,6 +94,14 @@ export type TimelineLatestTurn = Pick<
   "turnId" | "state" | "startedAt" | "completedAt"
 >;
 
+/**
+ * Retry affordance state for a terminal assistant message: "ready" re-runs
+ * the turn from its user message; "attachments-blocked" marks turns whose
+ * user message carried attachments (their upload payloads are gone, so a
+ * faithful resend is impossible).
+ */
+export type TimelineRetryState = "ready" | "attachments-blocked";
+
 export type MessagesTimelineRow =
   | {
       kind: "work";
@@ -129,6 +137,7 @@ export type MessagesTimelineRow =
       assistantCopyStreaming: boolean;
       assistantTurnDiffSummary?: TurnDiffSummary | undefined;
       revertTurnCount?: number | undefined;
+      retryState?: TimelineRetryState | undefined;
     }
   | {
       kind: "proposed-plan";
@@ -373,6 +382,7 @@ export function deriveMessagesTimelineRows(input: {
   activeTurnStartedAt: string | null;
   turnDiffSummaryByAssistantMessageId: ReadonlyMap<MessageId, TurnDiffSummary>;
   revertTurnCountByUserMessageId: ReadonlyMap<MessageId, number>;
+  retryStateByAssistantMessageId?: ReadonlyMap<MessageId, TimelineRetryState>;
 }): MessagesTimelineRow[] {
   const nextRows: MessagesTimelineRow[] = [];
   const durationStartByMessageId = computeMessageDurationStart(
@@ -521,6 +531,10 @@ export function deriveMessagesTimelineRows(input: {
         timelineEntry.message.role === "user"
           ? input.revertTurnCountByUserMessageId.get(timelineEntry.message.id)
           : undefined,
+      retryState:
+        timelineEntry.message.role === "assistant"
+          ? input.retryStateByAssistantMessageId?.get(timelineEntry.message.id)
+          : undefined,
     });
   }
 
@@ -594,7 +608,8 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
         a.showAssistantCopyButton === bm.showAssistantCopyButton &&
         a.assistantCopyStreaming === bm.assistantCopyStreaming &&
         a.assistantTurnDiffSummary === bm.assistantTurnDiffSummary &&
-        a.revertTurnCount === bm.revertTurnCount
+        a.revertTurnCount === bm.revertTurnCount &&
+        a.retryState === bm.retryState
       );
     }
   }

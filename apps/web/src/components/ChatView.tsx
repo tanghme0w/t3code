@@ -1,5 +1,6 @@
 import {
   type ApprovalRequestId,
+  type CheckpointRevertMode,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
@@ -65,7 +66,6 @@ import {
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { isElectron } from "../env";
-import { readLocalApi } from "../localApi";
 import { useDiffPanelStore } from "../diffPanelStore";
 import {
   collapseExpandedComposerCursor,
@@ -137,7 +137,7 @@ import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
-import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
+import { ChevronDownIcon, PencilLineIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
@@ -204,6 +204,8 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
+import { RevertPreviewDialog } from "./chat/RevertPreviewDialog"; // [thread-rewind]
+import { type TimelineRetryState } from "./chat/MessagesTimeline.logic";
 import { ChatHeader } from "./chat/ChatHeader";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -229,15 +231,19 @@ import {
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerImageForRetry,
+  countDiscardedMessages, // [thread-rewind]
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
   resolveSendEnvMode,
+  deriveRewindTargets, // [edit-message][thread-retry]
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   waitForServerThreadExists, // [thread-fork]
   waitForStartedServerThread,
+  waitForThreadRevertOutcome, // [edit-message]
 } from "./ChatView.logic";
+import { useRevertPreviewDiff } from "../state/queries"; // [thread-rewind]
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useComposerHandleContext } from "../composerHandleContext";
 import { sanitizeThreadErrorMessage } from "~/rpc/transportError";
@@ -255,6 +261,30 @@ import { useAssetUrls } from "../assets/assetUrls";
 
 const IMAGE_ONLY_BOOTSTRAP_PROMPT =
   "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+
+// [edit-message] Edit is non-destructive until send: entering edit mode only
+// prefills the composer and marks the boundary; the checkpoint rewind (and
+// the discard it implies) runs when the edited message is actually sent.
+// Cancel restores the stashed draft with zero thread changes.
+interface EditingMessageState {
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+  readonly messageCreatedAt: string;
+  readonly targetTurnCount: number;
+  readonly stashedPrompt: string;
+}
+
+// [thread-rewind] A pending destructive-rewind confirmation: either the
+// standalone rewind button ("rewind") or an edit being sent ("edit-send").
+// The dialog previews the workspace diff and picks the revert mode.
+interface RevertDialogState {
+  readonly variant: "rewind" | "edit-send";
+  readonly threadId: ThreadId;
+  readonly messageId: MessageId;
+  readonly messageCreatedAt: string;
+  readonly targetTurnCount: number;
+}
+
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -1114,6 +1144,14 @@ function ChatViewContent(props: ChatViewProps) {
   >({});
   const [isConnecting, _setIsConnecting] = useState(false);
   const [isRevertingCheckpoint, setIsRevertingCheckpoint] = useState(false);
+  // [edit-message]
+  const [editingMessage, setEditingMessage] = useState<EditingMessageState | null>(null);
+  const editingMessageRef = useRef(editingMessage);
+  editingMessageRef.current = editingMessage;
+  // [thread-rewind] Pending rewind confirmation dialog plus the edit-send
+  // decision, carried by ref so the re-entrant onSend call consumes it once.
+  const [revertDialog, setRevertDialog] = useState<RevertDialogState | null>(null);
+  const editSendDecisionRef = useRef<CheckpointRevertMode | null>(null);
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
@@ -1252,6 +1290,32 @@ function ChatViewContent(props: ChatViewProps) {
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
   const activeThreadId = activeThread?.id ?? null;
+  const activeThreadIdRef = useRef(activeThreadId);
+  activeThreadIdRef.current = activeThreadId;
+  const activeThreadStateRef = useRef(activeThread);
+  activeThreadStateRef.current = activeThread;
+
+  // [edit-message] Cancel: restore the stashed draft. The thread was never
+  // touched, so there is nothing else to roll back. Declared this early so
+  // the composer banner memo below can reference it.
+  const onCancelEditMessage = useCallback(() => {
+    const editing = editingMessageRef.current;
+    if (!editing) {
+      return;
+    }
+    editSendDecisionRef.current = null; // [thread-rewind]
+    setEditingMessage(null);
+    if (editing.threadId !== activeThreadIdRef.current) {
+      return;
+    }
+    promptRef.current = editing.stashedPrompt;
+    setComposerDraftPrompt(composerDraftTarget, editing.stashedPrompt);
+    composerRef.current?.resetCursorState({
+      cursor: collapseExpandedComposerCursor(editing.stashedPrompt, editing.stashedPrompt.length),
+      prompt: editing.stashedPrompt,
+      detectTrigger: true,
+    });
+  }, [composerDraftTarget, composerRef, setComposerDraftPrompt]);
   const runningTerminalIds = useThreadRunningTerminalIds({
     environmentId: activeThread?.environmentId ?? null,
     threadId: activeThreadId,
@@ -1657,6 +1721,23 @@ function ChatViewContent(props: ChatViewProps) {
       : "server";
   const composerBannerItems = useMemo<ComposerBannerStackItem[]>(() => {
     const items: ComposerBannerStackItem[] = [];
+    // [edit-message] Editing banner: informative, never blocking — the
+    // messages below the edited one stay visible (dimmed) until send.
+    if (editingMessage && editingMessage.threadId === activeThread?.id) {
+      items.push({
+        id: `editing-message:${editingMessage.messageId}`,
+        variant: "info",
+        icon: <PencilLineIcon />,
+        title: "Editing message",
+        description:
+          "Sending rewinds the conversation to this point and replaces the dimmed messages. Cancel to keep everything as is.",
+        actions: (
+          <Button size="xs" variant="outline" onClick={onCancelEditMessage}>
+            Cancel edit
+          </Button>
+        ),
+      });
+    }
     if (activeEnvironmentUnavailableState) {
       const connection = activeEnvironmentUnavailableState.connection;
       const isReconnecting =
@@ -1715,8 +1796,11 @@ function ChatViewContent(props: ChatViewProps) {
     return items;
   }, [
     activeEnvironmentUnavailableState,
+    activeThread?.id,
+    editingMessage,
     handleReconnectActiveEnvironment,
     navigate,
+    onCancelEditMessage,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,
@@ -2078,38 +2162,28 @@ function ChatViewContent(props: ChatViewProps) {
     }
     return byMessageId;
   }, [turnDiffSummaries]);
-  const revertTurnCountByUserMessageId = useMemo(() => {
-    const byUserMessageId = new Map<MessageId, number>();
-    for (let index = 0; index < timelineEntries.length; index += 1) {
-      const entry = timelineEntries[index];
-      if (!entry || entry.kind !== "message" || entry.message.role !== "user") {
-        continue;
-      }
-
-      for (let nextIndex = index + 1; nextIndex < timelineEntries.length; nextIndex += 1) {
-        const nextEntry = timelineEntries[nextIndex];
-        if (!nextEntry || nextEntry.kind !== "message") {
-          continue;
-        }
-        if (nextEntry.message.role === "user") {
-          break;
-        }
-        const summary = turnDiffSummaryByAssistantMessageId.get(nextEntry.message.id);
-        if (!summary) {
-          continue;
-        }
-        const turnCount =
-          summary.checkpointTurnCount ?? inferredCheckpointTurnCountByTurnId[summary.turnId];
-        if (typeof turnCount !== "number") {
-          break;
-        }
-        byUserMessageId.set(entry.message.id, Math.max(0, turnCount - 1));
-        break;
-      }
+  const { revertTurnCountByUserMessageId, retryContextByAssistantMessageId } = useMemo(
+    () =>
+      deriveRewindTargets({
+        timelineEntries,
+        turnDiffSummaryByAssistantMessageId,
+        inferredCheckpointTurnCountByTurnId,
+        checkpointCount: activeThread?.checkpoints.length ?? 0,
+      }),
+    [
+      activeThread?.checkpoints.length,
+      inferredCheckpointTurnCountByTurnId,
+      timelineEntries,
+      turnDiffSummaryByAssistantMessageId,
+    ],
+  );
+  const retryStateByAssistantMessageId = useMemo(() => {
+    const byMessageId = new Map<MessageId, TimelineRetryState>();
+    for (const [messageId, context] of retryContextByAssistantMessageId) {
+      byMessageId.set(messageId, context.hasAttachments ? "attachments-blocked" : "ready");
     }
-
-    return byUserMessageId;
-  }, [inferredCheckpointTurnCountByTurnId, timelineEntries, turnDiffSummaryByAssistantMessageId]);
+    return byMessageId;
+  }, [retryContextByAssistantMessageId]);
 
   const gitCwd = activeProject
     ? projectScriptCwd({
@@ -3821,60 +3895,77 @@ function ChatViewContent(props: ChatViewProps) {
     composerRef,
   ]);
 
-  const onRevertToTurnCount = useCallback(
-    async (turnCount: number) => {
-      const localApi = readLocalApi();
-      if (!localApi || !activeThread || isRevertingCheckpoint) return;
-
+  // [edit-message][thread-retry] Dispatches the checkpoint rewind and waits
+  // for it to apply (or fail) on the thread projection before the caller
+  // sends the follow-up message. No confirmation dialog: this only runs
+  // after an explicit send/retry, when the destructive intent is
+  // unambiguous — the boundary was already visible while editing.
+  const performDeferredRevert = useCallback(
+    async (input: {
+      readonly threadId: ThreadId;
+      readonly targetTurnCount: number;
+      readonly discardedMessageId: MessageId;
+      // [thread-rewind] Defaults to rolling workspace files back with the
+      // conversation; "conversation-only" keeps the files as they are.
+      readonly revertMode?: CheckpointRevertMode;
+    }): Promise<boolean> => {
       if (activeEnvironmentUnavailable && activeEnvironmentUnavailableLabel) {
         setThreadError(
-          activeThread.id,
-          `Reconnect ${activeEnvironmentUnavailableLabel} before reverting checkpoints.`,
+          input.threadId,
+          `Reconnect ${activeEnvironmentUnavailableLabel} before rewinding the thread.`,
         );
-        return;
+        return false;
       }
-      if (phase === "running" || isSendBusy || isConnecting) {
-        setThreadError(activeThread.id, "Interrupt the current turn before reverting checkpoints.");
-        return;
+      const sessionStatus = activeThreadStateRef.current?.session?.status;
+      if (sessionStatus === "running" || sessionStatus === "starting") {
+        setThreadError(input.threadId, "Interrupt the current turn before rewinding the thread.");
+        return false;
       }
-      const confirmed = await localApi.dialogs.confirm(
-        [
-          `Revert this thread to checkpoint ${turnCount}?`,
-          "This will discard newer messages and turn diffs in this thread.",
-          "This action cannot be undone.",
-        ].join("\n"),
-      );
-      if (!confirmed) {
-        return;
-      }
-
       setIsRevertingCheckpoint(true);
-      setThreadError(activeThread.id, null);
-      const result = await revertThreadCheckpoint({
-        environmentId,
-        input: {
-          threadId: activeThread.id,
-          turnCount,
-        },
-      });
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        setThreadError(
-          activeThread.id,
-          error instanceof Error ? error.message : "Failed to revert thread state.",
+      setThreadError(input.threadId, null);
+      try {
+        const result = await revertThreadCheckpoint({
+          environmentId,
+          input: {
+            threadId: input.threadId,
+            turnCount: input.targetTurnCount,
+            revertMode: input.revertMode ?? "workspace-and-conversation",
+          },
+        });
+        if (result._tag === "Failure") {
+          if (!isAtomCommandInterrupted(result)) {
+            const error = squashAtomCommandFailure(result);
+            setThreadError(
+              input.threadId,
+              error instanceof Error ? error.message : "Failed to rewind the thread.",
+            );
+          }
+          return false;
+        }
+        const outcome = await waitForThreadRevertOutcome(
+          scopeThreadRef(environmentId, input.threadId),
+          { discardedMessageId: input.discardedMessageId },
         );
+        if (outcome.outcome === "failed") {
+          setThreadError(input.threadId, `Rewind failed: ${outcome.detail}`);
+          return false;
+        }
+        if (outcome.outcome === "timeout") {
+          setThreadError(
+            input.threadId,
+            "Rewind timed out before completing — the message was not sent.",
+          );
+          return false;
+        }
+        return true;
+      } finally {
+        setIsRevertingCheckpoint(false);
       }
-      setIsRevertingCheckpoint(false);
     },
     [
-      activeThread,
       activeEnvironmentUnavailable,
       activeEnvironmentUnavailableLabel,
       environmentId,
-      isConnecting,
-      isRevertingCheckpoint,
-      isSendBusy,
-      phase,
       revertThreadCheckpoint,
       setThreadError,
     ],
@@ -3892,6 +3983,23 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     if (activePendingProgress) {
       onAdvanceActivePendingUserInput();
+      return;
+    }
+    // [thread-rewind] Sending an edit decides workspace handling first: open
+    // the preview dialog and re-enter onSend once a mode has been chosen.
+    const editingForGate = editingMessageRef.current;
+    if (
+      editingForGate &&
+      editingForGate.threadId === activeThread.id &&
+      editSendDecisionRef.current === null
+    ) {
+      setRevertDialog({
+        variant: "edit-send",
+        threadId: editingForGate.threadId,
+        messageId: editingForGate.messageId,
+        messageCreatedAt: editingForGate.messageCreatedAt,
+        targetTurnCount: editingForGate.targetTurnCount,
+      });
       return;
     }
     const sendCtx = composerRef.current?.getSendContext();
@@ -3987,6 +4095,30 @@ function ChatViewContent(props: ChatViewProps) {
 
     sendInFlightRef.current = true;
     beginLocalDispatch({ preparingWorktree: Boolean(baseBranchForWorktree) });
+
+    // [edit-message] Deferred discard: the edit only marked the boundary —
+    // the actual rewind (dropping the edited message and everything after
+    // it) runs now that the user has committed to sending. On failure the
+    // composer keeps the edited text and edit mode stays active, so nothing
+    // is lost.
+    const editingForSend = editingMessageRef.current;
+    if (editingForSend && editingForSend.threadId === threadIdForSend) {
+      // [thread-rewind] Consume the mode chosen in the send dialog exactly once.
+      const editRevertMode = editSendDecisionRef.current ?? "workspace-and-conversation";
+      editSendDecisionRef.current = null;
+      const reverted = await performDeferredRevert({
+        threadId: editingForSend.threadId,
+        targetTurnCount: editingForSend.targetTurnCount,
+        discardedMessageId: editingForSend.messageId,
+        revertMode: editRevertMode,
+      });
+      if (!reverted) {
+        sendInFlightRef.current = false;
+        resetLocalDispatch();
+        return;
+      }
+      setEditingMessage(null);
+    }
 
     const composerImagesSnapshot = [...composerImages];
     const composerTerminalContextsSnapshot = [...sendableComposerTerminalContexts];
@@ -4900,25 +5032,22 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [activeThreadRef, isServerThread, onDiffPanelOpen],
   );
-  // Both the Map and the revert handler are read from refs at call-time so
-  // the callback reference is fully stable and never busts context identity.
+  // Maps and thread state are read from refs at call-time so the callback
+  // references stay fully stable and never bust timeline context identity.
   const revertTurnCountRef = useRef(revertTurnCountByUserMessageId);
   revertTurnCountRef.current = revertTurnCountByUserMessageId;
-  const onRevertToTurnCountRef = useRef(onRevertToTurnCount);
-  onRevertToTurnCountRef.current = onRevertToTurnCount;
-  const onRevertUserMessage = useCallback((messageId: MessageId) => {
-    const targetTurnCount = revertTurnCountRef.current.get(messageId);
-    if (typeof targetTurnCount !== "number") {
-      return;
-    }
-    void onRevertToTurnCountRef.current(targetTurnCount);
-  }, []);
+  const retryContextRef = useRef(retryContextByAssistantMessageId);
+  retryContextRef.current = retryContextByAssistantMessageId;
+  const timelineEntriesRef = useRef(timelineEntries);
+  timelineEntriesRef.current = timelineEntries;
 
   // [thread-fork] Fork the thread at a user message: the new thread carries
   // the history BEFORE that message (provider session forks server-side) and
-  // the composer is prefilled with the message text for tweaking. User
-  // message rows carry no turnId in projections; the cut turn is the next
-  // assistant message's turn in the timeline (none → fork at tip).
+  // the composer is prefilled with the message text for tweaking. The message
+  // id is the authoritative boundary server-side; the cut turn is this
+  // message's own turn, found on the next assistant message in the timeline
+  // (the scan stops at the next user message so an unanswered boundary
+  // message can never borrow a later turn).
   const onForkFromMessage = useCallback(
     (input: { readonly messageId: MessageId; readonly prefillText: string }) => {
       void (async () => {
@@ -4927,12 +5056,15 @@ function ChatViewContent(props: ChatViewProps) {
         const entryIndex = timelineEntries.findIndex(
           (entry) => entry.kind === "message" && entry.message.id === input.messageId,
         );
-        for (let index = entryIndex; index >= 0 && index < timelineEntries.length; index += 1) {
-          const entry = timelineEntries[index];
-          if (!entry || entry.kind !== "message") continue;
-          if (entry.message.turnId !== null) {
-            cutTurnId = entry.message.turnId;
-            break;
+        if (entryIndex >= 0) {
+          for (let index = entryIndex + 1; index < timelineEntries.length; index += 1) {
+            const entry = timelineEntries[index];
+            if (!entry || entry.kind !== "message") continue;
+            if (entry.message.role === "user") break;
+            if (entry.message.turnId !== null) {
+              cutTurnId = entry.message.turnId;
+              break;
+            }
           }
         }
         const forkEnvironmentId = activeThread.environmentId;
@@ -4943,6 +5075,7 @@ function ChatViewContent(props: ChatViewProps) {
             threadId: nextThreadId,
             sourceThreadId: activeThread.id,
             atTurnId: cutTurnId,
+            atMessageId: input.messageId,
           },
         });
         if (result._tag === "Failure") {
@@ -4971,15 +5104,34 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThread, forkThread, navigate, setComposerDraftPrompt, setThreadError, timelineEntries],
   );
 
-  // [thread-fork] Edit & resend: prefill the composer with the message text,
-  // then revert the thread to just before that message (confirm dialog and
-  // busy-state guards live in onRevertToTurnCount).
+  // [edit-message] Enter edit mode: prefill the composer with the message
+  // text and stash the current draft for cancel. Nothing is discarded and no
+  // dialog is shown — the rewind runs when the edited message is sent, and
+  // cancel restores the stashed draft with zero thread changes.
   const onEditUserMessage = useCallback(
     (input: { readonly messageId: MessageId; readonly prefillText: string }) => {
+      const threadId = activeThreadIdRef.current;
       const targetTurnCount = revertTurnCountRef.current.get(input.messageId);
-      if (typeof targetTurnCount !== "number") {
+      if (!threadId || typeof targetTurnCount !== "number") {
         return;
       }
+      const entry = timelineEntriesRef.current.find(
+        (candidate) => candidate.kind === "message" && candidate.message.id === input.messageId,
+      );
+      const messageCreatedAt =
+        entry?.kind === "message" ? entry.message.createdAt : new Date().toISOString();
+      // Re-targeting an edit keeps the FIRST stash: it is the draft the user
+      // typed before entering any edit, which is what cancel must restore.
+      const existing = editingMessageRef.current;
+      const stashedPrompt =
+        existing && existing.threadId === threadId ? existing.stashedPrompt : promptRef.current;
+      setEditingMessage({
+        threadId,
+        messageId: input.messageId,
+        messageCreatedAt,
+        targetTurnCount,
+        stashedPrompt,
+      });
       promptRef.current = input.prefillText;
       setComposerDraftPrompt(composerDraftTarget, input.prefillText);
       composerRef.current?.resetCursorState({
@@ -4987,9 +5139,189 @@ function ChatViewContent(props: ChatViewProps) {
         prompt: input.prefillText,
         detectTrigger: true,
       });
-      void onRevertToTurnCountRef.current(targetTurnCount);
     },
     [composerDraftTarget, setComposerDraftPrompt],
+  );
+
+  // [edit-message] Edit mode is scoped to the thread it started on; leaving
+  // that thread abandons it (the prefilled text stays behind as a plain
+  // draft — safe, since nothing has been discarded). The rewind dialog and
+  // any undecided edit-send mode are dropped with it.
+  useEffect(() => {
+    const editing = editingMessageRef.current;
+    if (editing && editing.threadId !== activeThreadId) {
+      setEditingMessage(null);
+    }
+    editSendDecisionRef.current = null; // [thread-rewind]
+    setRevertDialog((current) => (current && current.threadId !== activeThreadId ? null : current));
+  }, [activeThreadId]);
+
+  // [thread-rewind] Standalone rewind entry: open the preview dialog anchored
+  // at this user message. Nothing is discarded until the dialog confirms.
+  const onRewindUserMessage = useCallback((input: { readonly messageId: MessageId }) => {
+    const threadId = activeThreadIdRef.current;
+    const targetTurnCount = revertTurnCountRef.current.get(input.messageId);
+    if (!threadId || typeof targetTurnCount !== "number") {
+      return;
+    }
+    const entry = timelineEntriesRef.current.find(
+      (candidate) => candidate.kind === "message" && candidate.message.id === input.messageId,
+    );
+    const messageCreatedAt =
+      entry?.kind === "message" ? entry.message.createdAt : new Date().toISOString();
+    setRevertDialog({
+      variant: "rewind",
+      threadId,
+      messageId: input.messageId,
+      messageCreatedAt,
+      targetTurnCount,
+    });
+  }, []);
+
+  // [thread-rewind] Diff the pending dialog's rewind would discard.
+  const revertPreview = useRevertPreviewDiff({
+    environmentId: revertDialog ? environmentId : null,
+    threadId: revertDialog?.threadId ?? null,
+    turnCount: revertDialog?.targetTurnCount ?? null,
+  });
+
+  // [thread-rewind] Dialog outcomes. Edit-send confirms stash the chosen mode
+  // and re-enter onSend, which consumes it exactly once; standalone rewinds
+  // revert immediately without resending anything.
+  const onRevertDialogCancel = () => {
+    editSendDecisionRef.current = null;
+    setRevertDialog(null);
+  };
+  const onRevertDialogConfirm = (mode: CheckpointRevertMode) => {
+    const dialog = revertDialog;
+    if (!dialog) {
+      return;
+    }
+    setRevertDialog(null);
+    if (dialog.variant === "edit-send") {
+      editSendDecisionRef.current = mode;
+      void onSend();
+      return;
+    }
+    void (async () => {
+      if (sendInFlightRef.current) {
+        return;
+      }
+      // A pending edit is superseded by rewinding — restore its stash first.
+      if (editingMessageRef.current) {
+        onCancelEditMessage();
+      }
+      await performDeferredRevert({
+        threadId: dialog.threadId,
+        targetTurnCount: dialog.targetTurnCount,
+        discardedMessageId: dialog.messageId,
+        revertMode: mode,
+      });
+    })();
+  };
+
+  // [thread-retry] Re-run the turn behind an assistant response: rewind to
+  // the checkpoint just before its user message, then resend that prompt
+  // verbatim. The composer draft is left untouched.
+  const onRetryFromMessage = useCallback(
+    (assistantMessageId: MessageId) => {
+      void (async () => {
+        const thread = activeThreadStateRef.current;
+        const retryContext = retryContextRef.current.get(assistantMessageId);
+        if (!thread || !retryContext || retryContext.hasAttachments) {
+          return;
+        }
+        if (sendInFlightRef.current) {
+          return;
+        }
+        // A pending edit would re-target the next send; retrying supersedes it.
+        if (editingMessageRef.current) {
+          onCancelEditMessage();
+        }
+        sendInFlightRef.current = true;
+        beginLocalDispatch({ preparingWorktree: false });
+        let turnStartSucceeded = false;
+        try {
+          const reverted = await performDeferredRevert({
+            threadId: thread.id,
+            targetTurnCount: retryContext.targetTurnCount,
+            discardedMessageId: retryContext.userMessageId,
+          });
+          if (!reverted) {
+            return;
+          }
+          const messageIdForSend = newMessageId();
+          const messageCreatedAt = new Date().toISOString();
+          // The resent message lands at the live edge, mirroring onSend.
+          isAtEndRef.current = true;
+          timelineScrollModeRef.current = "anchoring-new-turn";
+          liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
+          pendingTimelineAnchorRef.current = messageIdForSend;
+          activeTimelineAnchorIndexRef.current = null;
+          showScrollDebouncer.current.cancel();
+          setShowScrollToBottom(false);
+          setTimelineAnchor({
+            threadKey: scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+            messageId: messageIdForSend,
+          });
+          setOptimisticUserMessages((existing) => [
+            ...existing,
+            {
+              id: messageIdForSend,
+              role: "user",
+              text: retryContext.text,
+              turnId: null,
+              createdAt: messageCreatedAt,
+              updatedAt: messageCreatedAt,
+              streaming: false,
+            },
+          ]);
+          const startResult = await startThreadTurn({
+            environmentId: thread.environmentId,
+            input: {
+              threadId: thread.id,
+              message: {
+                messageId: messageIdForSend,
+                role: "user",
+                text: retryContext.text,
+                attachments: [],
+              },
+              runtimeMode: thread.runtimeMode,
+              interactionMode: thread.interactionMode,
+              createdAt: messageCreatedAt,
+            },
+          });
+          if (startResult._tag === "Failure") {
+            setOptimisticUserMessages((existing) =>
+              existing.filter((message) => message.id !== messageIdForSend),
+            );
+            if (!isAtomCommandInterrupted(startResult)) {
+              const error = squashAtomCommandFailure(startResult);
+              setThreadError(
+                thread.id,
+                error instanceof Error ? error.message : "Failed to retry the message.",
+              );
+            }
+            return;
+          }
+          turnStartSucceeded = true;
+        } finally {
+          sendInFlightRef.current = false;
+          if (!turnStartSucceeded) {
+            resetLocalDispatch();
+          }
+        }
+      })();
+    },
+    [
+      beginLocalDispatch,
+      onCancelEditMessage,
+      performDeferredRevert,
+      resetLocalDispatch,
+      setThreadError,
+      setTimelineAnchor,
+      startThreadTurn,
+    ],
   );
 
   // Empty state: no active thread
@@ -5174,10 +5506,17 @@ function ChatViewContent(props: ChatViewProps) {
                 routeThreadKey={routeThreadKey}
                 onOpenTurnDiff={onOpenTurnDiff}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
-                onRevertUserMessage={onRevertUserMessage}
+                retryStateByAssistantMessageId={retryStateByAssistantMessageId} // [thread-retry]
+                onRetryFromMessage={onRetryFromMessage} // [thread-retry]
                 onForkFromMessage={onForkFromMessage} // [thread-fork]
                 onEditUserMessage={onEditUserMessage} // [thread-fork]
+                onRewindUserMessage={onRewindUserMessage} // [thread-rewind]
                 isRevertingCheckpoint={isRevertingCheckpoint}
+                editingFromCreatedAt={
+                  editingMessage && editingMessage.threadId === activeThread.id
+                    ? editingMessage.messageCreatedAt
+                    : null
+                } // [edit-message]
                 onImageExpand={onExpandTimelineImage}
                 markdownCwd={gitCwd ?? undefined}
                 resolvedTheme={resolvedTheme}
@@ -5191,6 +5530,23 @@ function ChatViewContent(props: ChatViewProps) {
                 onIsAtEndChange={onIsAtEndChange}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
               />
+
+              {/* [thread-rewind] Destructive-rewind confirmation with diff preview */}
+              {revertDialog && revertDialog.threadId === activeThread.id ? (
+                <RevertPreviewDialog
+                  variant={revertDialog.variant}
+                  discardedMessageCount={countDiscardedMessages(
+                    activeThread.messages,
+                    revertDialog.messageCreatedAt,
+                  )}
+                  previewPending={revertPreview.isPending}
+                  previewError={revertPreview.error}
+                  previewDiff={revertPreview.data?.diff ?? null}
+                  confirmBusy={isRevertingCheckpoint || isSendBusy}
+                  onConfirm={onRevertDialogConfirm}
+                  onCancel={onRevertDialogCancel}
+                />
+              ) : null}
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
               {showScrollToBottom && (

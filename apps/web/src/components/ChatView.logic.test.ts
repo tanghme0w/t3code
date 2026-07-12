@@ -1,20 +1,32 @@
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import type { Thread } from "../types";
+import type { ChatMessage, Thread, TurnDiffSummary } from "../types";
+import type { TimelineEntry } from "../session-logic";
 import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   buildExpiredTerminalContextToastCopy,
   buildThreadTurnInterruptInput,
+  countDiscardedMessages, // [thread-rewind]
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  deriveRewindTargets,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
   resolveSendEnvMode,
   shouldWriteThreadErrorToCurrentServerThread,
+  summarizeUnifiedDiff, // [thread-rewind]
 } from "./ChatView.logic";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -452,5 +464,223 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingApproval: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, hasPendingUserInput: true })).toBe(true);
     expect(hasServerAcknowledgedLocalDispatch({ ...common, threadError: "failed" })).toBe(true);
+  });
+});
+
+describe("deriveRewindTargets", () => {
+  function userMessage(
+    id: string,
+    createdAt: string,
+    extra: Partial<ChatMessage> = {},
+  ): ChatMessage {
+    return {
+      id: MessageId.make(id),
+      role: "user",
+      text: `text of ${id}`,
+      turnId: null,
+      streaming: false,
+      createdAt,
+      updatedAt: createdAt,
+      ...extra,
+    };
+  }
+
+  function assistantMessage(id: string, turnId: string, createdAt: string): ChatMessage {
+    return {
+      id: MessageId.make(id),
+      role: "assistant",
+      text: `answer ${id}`,
+      turnId: TurnId.make(turnId),
+      streaming: false,
+      createdAt,
+      updatedAt: createdAt,
+    };
+  }
+
+  function messageEntry(message: ChatMessage): TimelineEntry {
+    return { id: `entry-${message.id}`, kind: "message", createdAt: message.createdAt, message };
+  }
+
+  function summary(
+    turnId: string,
+    checkpointTurnCount: number,
+    assistantId: string,
+  ): TurnDiffSummary {
+    return {
+      turnId: TurnId.make(turnId),
+      checkpointTurnCount,
+      checkpointRef: CheckpointRef.make(`refs/t3/checkpoints/${turnId}`),
+      status: "ready",
+      files: [],
+      assistantMessageId: MessageId.make(assistantId),
+      completedAt: `2026-03-29T00:0${checkpointTurnCount}:00.000Z`,
+    };
+  }
+
+  const user1 = userMessage("msg-user-1", "2026-03-29T00:00:00.000Z");
+  const asst1 = assistantMessage("msg-asst-1", "turn-1", "2026-03-29T00:00:30.000Z");
+  const user2 = userMessage("msg-user-2", "2026-03-29T00:02:00.000Z");
+  const asst2 = assistantMessage("msg-asst-2", "turn-2", "2026-03-29T00:02:30.000Z");
+
+  it("targets the checkpoint state just before each user message", () => {
+    const targets = deriveRewindTargets({
+      timelineEntries: [user1, asst1, user2, asst2].map(messageEntry),
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [asst1.id, summary("turn-1", 1, "msg-asst-1")],
+        [asst2.id, summary("turn-2", 2, "msg-asst-2")],
+      ]),
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 2,
+    });
+
+    expect(targets.revertTurnCountByUserMessageId.get(user1.id)).toBe(0);
+    expect(targets.revertTurnCountByUserMessageId.get(user2.id)).toBe(1);
+    expect(targets.retryContextByAssistantMessageId.get(asst1.id)).toEqual({
+      userMessageId: user1.id,
+      text: user1.text,
+      hasAttachments: false,
+      targetTurnCount: 0,
+    });
+    expect(targets.retryContextByAssistantMessageId.get(asst2.id)).toEqual({
+      userMessageId: user2.id,
+      text: user2.text,
+      hasAttachments: false,
+      targetTurnCount: 1,
+    });
+  });
+
+  it("keeps targets available when the latest turn broke before its checkpoint", () => {
+    // asst2's turn was interrupted: no diff summary ever landed for it.
+    const targets = deriveRewindTargets({
+      timelineEntries: [user1, asst1, user2, asst2].map(messageEntry),
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [asst1.id, summary("turn-1", 1, "msg-asst-1")],
+      ]),
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 1,
+    });
+
+    expect(targets.revertTurnCountByUserMessageId.get(user2.id)).toBe(1);
+    expect(targets.retryContextByAssistantMessageId.get(asst2.id)).toEqual({
+      userMessageId: user2.id,
+      text: user2.text,
+      hasAttachments: false,
+      targetTurnCount: 1,
+    });
+  });
+
+  it("marks retries for user messages that carried attachments", () => {
+    const userWithImage = userMessage("msg-user-img", "2026-03-29T00:04:00.000Z", {
+      attachments: [
+        {
+          type: "image",
+          id: "att-1",
+          name: "shot.png",
+          mimeType: "image/png",
+          sizeBytes: 10,
+        },
+      ],
+    });
+    const asst3 = assistantMessage("msg-asst-3", "turn-3", "2026-03-29T00:04:30.000Z");
+
+    const targets = deriveRewindTargets({
+      timelineEntries: [user1, asst1, userWithImage, asst3].map(messageEntry),
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [asst1.id, summary("turn-1", 1, "msg-asst-1")],
+      ]),
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 1,
+    });
+
+    expect(targets.retryContextByAssistantMessageId.get(asst3.id)?.hasAttachments).toBe(true);
+  });
+
+  it("attaches every commentary message of a turn to the same retry context", () => {
+    const commentary = assistantMessage(
+      "msg-asst-commentary",
+      "turn-1",
+      "2026-03-29T00:00:20.000Z",
+    );
+
+    const targets = deriveRewindTargets({
+      timelineEntries: [user1, commentary, asst1].map(messageEntry),
+      turnDiffSummaryByAssistantMessageId: new Map([
+        [asst1.id, summary("turn-1", 1, "msg-asst-1")],
+      ]),
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 1,
+    });
+
+    expect(targets.retryContextByAssistantMessageId.get(commentary.id)?.userMessageId).toBe(
+      user1.id,
+    );
+    expect(targets.retryContextByAssistantMessageId.get(asst1.id)?.userMessageId).toBe(user1.id);
+  });
+
+  it("exposes no targets for threads without checkpoint coverage", () => {
+    const targets = deriveRewindTargets({
+      timelineEntries: [user1, asst1].map(messageEntry),
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      inferredCheckpointTurnCountByTurnId: {},
+      checkpointCount: 0,
+    });
+
+    expect(targets.revertTurnCountByUserMessageId.size).toBe(0);
+    expect(targets.retryContextByAssistantMessageId.size).toBe(0);
+  });
+});
+
+// [thread-rewind] ------------------------------------------------------------
+
+describe("summarizeUnifiedDiff", () => {
+  it("summarizes per-file additions and deletions, ignoring file headers", () => {
+    const patch = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "index 1111111..2222222 100644",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " unchanged",
+      "+added line",
+      "+another added",
+      "-removed line",
+      "diff --git a/docs/old.md b/docs/new.md",
+      "similarity index 90%",
+      "rename from docs/old.md",
+      "rename to docs/new.md",
+      "--- a/docs/old.md",
+      "+++ b/docs/new.md",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+
+    const summary = summarizeUnifiedDiff(patch);
+
+    expect(summary.files).toEqual([
+      { path: "src/a.ts", additions: 2, deletions: 1 },
+      { path: "docs/new.md", additions: 1, deletions: 1 },
+    ]);
+    expect(summary.additions).toBe(3);
+    expect(summary.deletions).toBe(2);
+  });
+
+  it("returns an empty summary for an empty patch", () => {
+    expect(summarizeUnifiedDiff("")).toEqual({ files: [], additions: 0, deletions: 0 });
+  });
+});
+
+describe("countDiscardedMessages", () => {
+  it("counts messages at or after the anchor timestamp — the timeline dim rule", () => {
+    const messages = [
+      { createdAt: "2026-07-12T10:00:00.000Z" },
+      { createdAt: "2026-07-12T10:01:00.000Z" },
+      { createdAt: "2026-07-12T10:02:00.000Z" },
+    ];
+
+    expect(countDiscardedMessages(messages, "2026-07-12T10:01:00.000Z")).toBe(2);
+    expect(countDiscardedMessages(messages, "2026-07-12T09:00:00.000Z")).toBe(3);
+    expect(countDiscardedMessages(messages, "2026-07-12T11:00:00.000Z")).toBe(0);
+    expect(countDiscardedMessages([], "2026-07-12T10:00:00.000Z")).toBe(0);
   });
 });
