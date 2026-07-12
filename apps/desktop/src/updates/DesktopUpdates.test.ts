@@ -16,6 +16,8 @@ import * as TestClock from "effect/testing/TestClock";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
@@ -107,6 +109,41 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
     syncAllAppearance: () => Effect.void,
   } satisfies ElectronWindow.ElectronWindow["Service"]);
 
+  const errorBoxes: Array<{ title: string; content: string }> = [];
+  let quitCount = 0;
+
+  const appLayer = Layer.succeed(ElectronApp.ElectronApp, {
+    metadata: Effect.die("unexpected metadata read"),
+    name: Effect.succeed("Agent Hub Code"),
+    whenReady: Effect.void,
+    quit: Effect.sync(() => {
+      quitCount += 1;
+    }),
+    exit: () => Effect.void,
+    relaunch: () => Effect.void,
+    setPath: () => Effect.void,
+    setName: () => Effect.void,
+    setAboutPanelOptions: () => Effect.void,
+    setAppUserModelId: () => Effect.void,
+    requestSingleInstanceLock: Effect.succeed(true),
+    isDefaultProtocolClient: () => Effect.succeed(false),
+    setAsDefaultProtocolClient: () => Effect.succeed(true),
+    setDesktopName: () => Effect.void,
+    setDockIcon: () => Effect.void,
+    appendCommandLineSwitch: () => Effect.void,
+    on: () => Effect.void,
+  } satisfies ElectronApp.ElectronApp["Service"]);
+
+  const dialogLayer = Layer.succeed(ElectronDialog.ElectronDialog, {
+    pickFolder: () => Effect.succeed(Option.none()),
+    confirm: () => Effect.succeed(false),
+    showMessageBox: () => Effect.succeed({ response: 0, checkboxChecked: false }),
+    showErrorBox: (title, content) =>
+      Effect.sync(() => {
+        errorBoxes.push({ title, content });
+      }),
+  } satisfies ElectronDialog.ElectronDialog["Service"]);
+
   const stubBackendInstance: DesktopBackendPool.DesktopBackendInstance = {
     id: DesktopBackendPool.PRIMARY_INSTANCE_ID,
     label: Effect.succeed("Windows"),
@@ -167,6 +204,8 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
   const layer = DesktopUpdates.layer.pipe(
     Layer.provideMerge(updaterLayer),
     Layer.provideMerge(windowLayer),
+    Layer.provideMerge(appLayer),
+    Layer.provideMerge(dialogLayer),
     Layer.provideMerge(backendLayer),
     Layer.provideMerge(DesktopState.layer),
     Layer.provideMerge(settingsLayer),
@@ -185,6 +224,8 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
   return {
     layer,
     checkCount: () => checkCount,
+    errorBoxes: () => errorBoxes,
+    quitCount: () => quitCount,
     feedUrls: () => feedUrls,
     listenerCount: () =>
       Array.from(listeners.values()).reduce(
@@ -453,8 +494,40 @@ describe("DesktopUpdates", () => {
         assert.equal(failedState.errorContext, "install");
         assert.equal(failedState.message, "Desktop update install action failed unexpectedly.");
 
+        // The failure happened before window teardown, so the app must stay up
+        // for the user to retry — no failure dialog, no quit.
+        assert.equal(harness.errorBoxes().length, 0);
+        assert.equal(harness.quitCount(), 0);
+
         const changedState = yield* updates.setChannel("nightly");
         assert.equal(changedState.channel, "nightly");
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("shows a failure dialog and quits when an install fails after window teardown", () => {
+    const harness = makeHarness();
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+
+        // install() tears down the windows before quitAndInstall; the stub
+        // quitAndInstall resolves, so the install-in-flight flag stays set.
+        const result = yield* updates.install;
+        assert.isTrue(result.accepted);
+
+        // Squirrel then reports the install failed asynchronously. With the
+        // windows already gone there is nothing to recover to.
+        harness.emit("error", new Error("install rejected by Squirrel"));
+        yield* flushCallbacks;
+
+        assert.equal(harness.errorBoxes().length, 1);
+        assert.equal(harness.errorBoxes()[0]?.title, "Update failed");
+        assert.equal(harness.quitCount(), 1);
       }),
     ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });

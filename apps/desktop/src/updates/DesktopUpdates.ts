@@ -23,6 +23,8 @@ import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
+import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as IpcChannels from "../ipc/channels.ts";
@@ -245,6 +247,8 @@ export const make = Effect.gen(function* () {
   const desktopState = yield* DesktopState.DesktopState;
   const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
   const electronWindow = yield* ElectronWindow.ElectronWindow;
+  const electronApp = yield* ElectronApp.ElectronApp;
+  const electronDialog = yield* ElectronDialog.ElectronDialog;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
@@ -253,6 +257,10 @@ export const make = Effect.gen(function* () {
   const updateCheckInFlightRef = yield* Ref.make(false);
   const updateDownloadInFlightRef = yield* Ref.make(false);
   const updateInstallInFlightRef = yield* Ref.make(false);
+  // True once installDownloadedUpdate has torn down the windows (right before
+  // quitAndInstall). A failure after this point can't fall back to the UI, so
+  // it must terminate the app instead of lingering as a headless Dock zombie.
+  const installWindowsTornDownRef = yield* Ref.make(false);
   const updaterConfiguredRef = yield* Ref.make(false);
   const lastLoggedDownloadMilestoneRef = yield* Ref.make(-1);
   const updateStateRef = yield* Ref.make<DesktopUpdateState>(
@@ -444,6 +452,23 @@ export const make = Effect.gen(function* () {
     { discard: true },
   );
 
+  // Once the windows are torn down there is no UI left to recover to, so a
+  // failed install must not leave the app running headless (a Dock zombie the
+  // user has to force-quit — the upstream behavior). Surface the failure in a
+  // native error box, then quit. No-op before teardown, where the in-UI error
+  // state still lets the user retry.
+  const terminateAfterInstallFailure = (detail: string) =>
+    Effect.gen(function* () {
+      if (!(yield* Ref.get(installWindowsTornDownRef))) {
+        return;
+      }
+      yield* electronDialog.showErrorBox(
+        "Update failed",
+        `Agent Hub Code couldn't install the update and will now quit. Reopen the app to keep using the current version.\n\n${detail}`,
+      );
+      yield* electronApp.quit;
+    });
+
   const installDownloadedUpdate = Effect.gen(function* () {
     const state = yield* Ref.get(updateStateRef);
     if (
@@ -456,6 +481,7 @@ export const make = Effect.gen(function* () {
 
     yield* Ref.set(desktopState.quitting, true);
     yield* Ref.set(updateInstallInFlightRef, true);
+    yield* Ref.set(installWindowsTornDownRef, false);
 
     return yield* Effect.gen(function* () {
       // Stop every backend in the pool, not just the primary. With
@@ -472,6 +498,7 @@ export const make = Effect.gen(function* () {
         { concurrency: "unbounded" },
       );
       yield* electronWindow.destroyAll;
+      yield* Ref.set(installWindowsTornDownRef, true);
       yield* electronUpdater.quitAndInstall({
         isSilent: true,
         isForceRunAfter: true,
@@ -491,6 +518,7 @@ export const make = Effect.gen(function* () {
               isSilent: error.isSilent,
               isForceRunAfter: error.isForceRunAfter,
             });
+            yield* terminateAfterInstallFailure(error.message);
             return { accepted: true, completed: false };
           },
         ),
@@ -510,6 +538,7 @@ export const make = Effect.gen(function* () {
             errorTag: error._tag,
             action: error.action,
           });
+          yield* terminateAfterInstallFailure(error.message);
           return { accepted: true, completed: false };
         }),
       ),
@@ -613,6 +642,7 @@ export const make = Effect.gen(function* () {
         errorTag: error._tag,
         operation: error.operation,
       });
+      yield* terminateAfterInstallFailure(error.message);
       return;
     }
 
