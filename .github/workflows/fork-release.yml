@@ -7,9 +7,15 @@ name: Fork Release
 # embed this repo as their electron-updater feed (GITHUB_REPOSITORY at build
 # time), so installed apps auto-update from these releases.
 #
-# The build is signed + notarized when the Apple secrets are present (see
-# docs/operations/release.md); otherwise it falls back to an unsigned build
-# whose auto-update install may be blocked by macOS Gatekeeper.
+# The build is signed when the Developer ID secrets (CSC_LINK +
+# CSC_KEY_PASSWORD) are present, and additionally notarized when the App Store
+# Connect API-key secrets (APPLE_API_*) are also present (see
+# docs/operations/release.md). Signing is what desktop auto-update requires: a
+# stable Developer ID identity lets Squirrel.Mac accept signed->signed updates.
+# Notarization only governs Gatekeeper's first-launch check for freshly
+# downloaded (quarantined) apps, so it is optional for self-use on a Mac that
+# already trusts the cert. With no secrets it falls back to an unsigned build
+# whose in-place auto-update install macOS will reject.
 
 on:
   push:
@@ -79,10 +85,11 @@ jobs:
       - name: Build desktop artifact
         shell: bash
         env:
-          # macOS Developer ID signing + notarization. Leave every secret unset
-          # to build unsigned (auto-update install may be blocked by Gatekeeper).
+          # macOS Developer ID signing (required for auto-update). Leave both
+          # CSC_* unset to build unsigned (its in-place auto-update is rejected).
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          # Optional: adding these three also notarizes the signed build.
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -109,32 +116,43 @@ jobs:
             return 0
           }
 
-          if has_all "$CSC_LINK" "$CSC_KEY_PASSWORD" "$APPLE_API_KEY" "$APPLE_API_KEY_ID" "$APPLE_API_ISSUER"; then
-            # electron-builder reads the notarization key from a file path.
-            key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-            printf '%s' "$APPLE_API_KEY" > "$key_path"
-            export APPLE_API_KEY="$key_path"
+          if has_all "$CSC_LINK" "$CSC_KEY_PASSWORD"; then
+            # Signing is enough for auto-update (a stable Developer ID identity
+            # satisfies Squirrel.Mac's designated-requirement check). Notarize
+            # additionally only when an App Store Connect API key is supplied.
+            if has_all "$APPLE_API_KEY" "$APPLE_API_KEY_ID" "$APPLE_API_ISSUER"; then
+              # electron-builder reads the notarization key from a file path.
+              key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+              printf '%s' "$APPLE_API_KEY" > "$key_path"
+              export APPLE_API_KEY="$key_path"
 
-            # Opt into Clerk passkey (Associated Domains) signing only when a
-            # provisioning profile is supplied. Otherwise do a plain Developer ID
-            # sign + notarize, which is all desktop auto-update needs.
-            if [[ -n "$MACOS_PROVISIONING_PROFILE" ]]; then
-              if [[ -z "$APPLE_TEAM_ID" ]]; then
-                echo "MACOS_PROVISIONING_PROFILE is set but APPLE_TEAM_ID is missing." >&2
-                exit 1
+              # Opt into Clerk passkey (Associated Domains) signing only when a
+              # provisioning profile is supplied. Otherwise do a plain Developer
+              # ID sign + notarize.
+              if [[ -n "$MACOS_PROVISIONING_PROFILE" ]]; then
+                if [[ -z "$APPLE_TEAM_ID" ]]; then
+                  echo "MACOS_PROVISIONING_PROFILE is set but APPLE_TEAM_ID is missing." >&2
+                  exit 1
+                fi
+                profile_path="$RUNNER_TEMP/agent-hub-code.provisionprofile"
+                printf '%s' "$MACOS_PROVISIONING_PROFILE" | base64 -D > "$profile_path"
+                security cms -D -i "$profile_path" >/dev/null
+                export T3CODE_APPLE_TEAM_ID="$APPLE_TEAM_ID"
+                export T3CODE_MACOS_PROVISIONING_PROFILE="$profile_path"
+                echo "macOS signing enabled (Developer ID + notarization + passkey Associated Domains)."
+              else
+                echo "macOS signing enabled (Developer ID + notarization)."
               fi
-              profile_path="$RUNNER_TEMP/agent-hub-code.provisionprofile"
-              printf '%s' "$MACOS_PROVISIONING_PROFILE" | base64 -D > "$profile_path"
-              security cms -D -i "$profile_path" >/dev/null
-              export T3CODE_APPLE_TEAM_ID="$APPLE_TEAM_ID"
-              export T3CODE_MACOS_PROVISIONING_PROFILE="$profile_path"
-              echo "macOS signing enabled (Developer ID + notarization + passkey Associated Domains)."
             else
-              echo "macOS signing enabled (Developer ID + notarization)."
+              # No API key: sign only. build-desktop-artifact.ts keeps CSC_* and
+              # scrubs the empty APPLE_API_* vars, so electron-builder signs
+              # without notarizing. Fine for self-use on a Mac that trusts the
+              # cert; a fresh download on another Mac would hit Gatekeeper.
+              echo "macOS signing enabled (Developer ID, notarization skipped: add APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER to notarize)."
             fi
             args+=(--signed)
           else
-            echo "macOS signing disabled: set CSC_LINK, CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER to enable."
+            echo "macOS signing disabled: set CSC_LINK and CSC_KEY_PASSWORD to enable (add the APPLE_API_* secrets to also notarize)."
           fi
 
           vp run dist:desktop:artifact "${args[@]}"
