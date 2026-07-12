@@ -2,8 +2,9 @@
 
 A pinned right-hand rail beside the conversation column that summarizes the
 thread's work — the assistant's todo list (TodoWrite plan steps) first, then
-the harness-tracked background tasks (subagents, background commands) — with
-live status, modeled on Codex's pinned-summary layout. When the rail is open
+a status board for the harness-tracked tasks (subagents, background commands,
+workflows) with live status and click-to-expand detail rows, modeled on
+Codex's pinned-summary layout. When the rail is open
 the conversation column (timeline _and_ composer) yields width and re-centers
 in the remaining space, mirroring the left sidebar as a three-column layout.
 There is never overlay/occlusion: the rail participates in the chat area's
@@ -18,11 +19,13 @@ rail shows both, on separate cards:
   assistant's plan checklist for the turn. The adapter parses TodoWrite tool
   input into `turn.plan.updated` runtime events (`plan: [{ step, status }]`).
   Surface: the rail's **To-dos** card (and the right-hand Plan panel).
-- **Harness task lifecycle** (`task_started/…/task_updated` system messages,
-  managed by the CLI's `TaskCreate/TaskUpdate/TaskList` tools): tracked
-  _background work_ — background shell commands, subagents, workflows. Their
-  `description` is typically the command line, which is why this card fills
-  with `cmd`s. Surface: the rail's **Background tasks** card.
+- **Harness task lifecycle** (`task_started/…/task_updated` system messages):
+  the CLI's registry of _execution units_ — subagents (`local_agent` /
+  `remote_agent`), background shell commands (`local_bash`), workflows
+  (`local_workflow`). Distinct from the model-driven to-do tools
+  (`TaskCreate` / `TaskUpdate` / `TaskList`), whose results the adapter folds
+  into `turn.plan.updated` ("Claude Tasks") for the Plan panel. Surface: the
+  rail's **Agents & processes** card.
 
 ## Data flow
 
@@ -53,13 +56,27 @@ Claude CLI system messages                 (task_started / task_progress /
   → OrchestrationThread.activities         packages/client-runtime threadReducer
   → deriveThreadTaskList                   apps/web/src/lib/taskList.ts
       folds the four activity kinds into an ordered task map; `task.updated`
-      payloads are incremental patches (only defined fields merge)
+      payloads are incremental patches (only defined fields merge); progress
+      summaries accumulate into a bounded per-task history (last 30,
+      consecutive duplicates collapsed)
   → useTaskSummaryRail / TaskSummaryRail   apps/web/src/components/chat/TaskSummaryRail.tsx
   → TaskListCard                           apps/web/src/components/chat/TaskListCard.tsx
 ```
 
 Notes on the wire format:
 
+- `task_started` carries the task's identity: `description`, `task_type`
+  (`local_agent` / `remote_agent` / `local_bash` / `local_workflow`),
+  `subagent_type` (Task-tool subagents, e.g. `Explore`), `workflow_name`, and
+  the subagent `prompt`. The adapter forwards all of these; ingestion bounds
+  `prompt` at 2000 chars (`description` at the usual 180) before persisting.
+  `deriveThreadTaskList` classifies each entry into a coarse `kind`
+  (`agent` / `process` / `workflow`, falling back to `task` for activities
+  persisted before these fields existed).
+- `task_progress` carries `summary`, `last_tool_name`, and `usage`
+  (`total_tokens` / `tool_uses` / `duration_ms`); `task_notification`
+  (→ `task.completed`) carries the final `summary`, settle `status`, and
+  final `usage`.
 - `task_updated` is the Claude CLI's incremental patch of a tracked task's
   state (`patch: { status?, description?, error?, is_backgrounded?, … }`,
   statuses `pending/running/completed/failed/killed/paused`). Clients are
@@ -68,6 +85,8 @@ Notes on the wire format:
 - `task.*` activities are excluded from the Work Log
   (`deriveWorkLogEntries` in `apps/web/src/session-logic.ts`) — the rail is
   their surface.
+- Not yet surfaced: `task_notification.output_file` (the task's transcript
+  path on the server) — a future "open transcript" affordance.
 
 ## UI pieces
 
@@ -78,9 +97,14 @@ Notes on the wire format:
 - `TaskSummaryRail` — the `<aside>` column (19.5rem, hidden on `max-sm`).
 - `TodoListCard` — the To-dos card: TodoWrite plan steps with per-step status
   icons, progress bar, `completed/total` counter.
-- `TaskListCard` — the Background-tasks card: status icons, progress bar,
-  `n/m` counter, live mid-task summaries, `bg` badge for backgrounded tasks;
-  rows truncate to one line and click-toggle to full wrapped text.
+- `TaskListCard` — the Agents & processes status board: per-row status icon,
+  kind chip (subagent type / `bash` / workflow name), live elapsed time and
+  latest summary while running, `bg` badge for backgrounded tasks. Clicking a
+  row expands a detail panel (a sibling of the row button, so its text stays
+  selectable): runtime stat chips (status, duration, tokens, tool uses,
+  current tool), the accumulated progress timeline, the subagent prompt, and
+  full error text. A 1s ticker drives the elapsed readout only while a task
+  is running.
 - The header's task-summary toggle lives in
   `apps/web/src/components/chat/PanelLayoutControls.tsx` behind optional
   props (`taskSummaryAvailable/taskSummaryOpen/onToggleTaskSummary`); it only
@@ -108,10 +132,13 @@ The todo card deliberately reuses upstream's plan pipeline
 Shared files carry deliberately minimal diffs:
 
 - `packages/contracts/src/providerRuntime.ts` — `task.updated` event type +
-  payload.
-- `ClaudeAdapter.ts` — one `case "task_updated"` in the system-message switch.
+  payload; optional `subagentType/workflowName/prompt` on
+  `TaskStartedPayload`.
+- `ClaudeAdapter.ts` — one `case "task_updated"` in the system-message
+  switch; three forwarded fields in `case "task_started"`.
 - `ProviderRuntimeIngestion.ts` — one `case "task.updated"` in
-  `runtimeEventToActivities`.
+  `runtimeEventToActivities`; three passthrough fields in
+  `case "task.started"`.
 - `session-logic.ts` — one Work Log exclusion line.
 - `PanelLayoutControls.tsx` — optional toggle props (inert when unused).
 - `ChatView.tsx` — one import, one hook call, three toggle props, one

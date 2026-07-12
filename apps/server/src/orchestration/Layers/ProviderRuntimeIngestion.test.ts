@@ -2989,6 +2989,48 @@ describe("ProviderRuntimeIngestion", () => {
     ).toBe("# Plan title");
   });
 
+  it("carries subagent identity fields through task.started activities", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "task.started",
+      eventId: asEventId("evt-task-agent-started"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-task-agent"),
+      payload: {
+        taskId: "task-agent-1",
+        taskType: "local_agent",
+        subagentType: "Explore",
+        description: "Map the event pipeline",
+        prompt: `Trace the task activities end to end. ${"x".repeat(2100)}`,
+      },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-agent-started",
+      ),
+    );
+
+    const started = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-task-agent-started",
+    );
+    const payload =
+      started?.payload && typeof started.payload === "object"
+        ? (started.payload as Record<string, unknown>)
+        : undefined;
+
+    expect(started?.summary).toBe("local_agent task started");
+    expect(payload?.subagentType).toBe("Explore");
+    expect(payload?.detail).toBe("Map the event pipeline");
+    expect(typeof payload?.prompt).toBe("string");
+    expect((payload?.prompt as string).length).toBe(2000);
+    expect((payload?.prompt as string).endsWith("...")).toBe(true);
+  });
+
   it("projects structured user input request and resolution as thread activities", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

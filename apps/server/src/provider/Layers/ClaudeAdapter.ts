@@ -2755,6 +2755,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             taskId: RuntimeTaskId.make(message.task_id),
             description: message.description,
             ...(message.task_type ? { taskType: message.task_type } : {}),
+            ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
+            ...(message.workflow_name ? { workflowName: message.workflow_name } : {}),
+            ...(message.prompt?.trim() ? { prompt: message.prompt.trim() } : {}),
           },
         });
         return;

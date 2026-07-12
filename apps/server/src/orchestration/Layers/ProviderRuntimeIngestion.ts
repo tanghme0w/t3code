@@ -483,6 +483,9 @@ function runtimeEventToActivities(
           payload: {
             taskId: event.payload.taskId,
             ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.subagentType ? { subagentType: event.payload.subagentType } : {}),
+            ...(event.payload.workflowName ? { workflowName: event.payload.workflowName } : {}),
+            ...(event.payload.prompt ? { prompt: truncateDetail(event.payload.prompt, 2000) } : {}),
             ...(event.payload.description
               ? { detail: truncateDetail(event.payload.description) }
               : {}),
